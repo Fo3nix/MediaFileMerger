@@ -1,0 +1,24 @@
+[project]
+name = "photoprocessor"
+version = "0.1.0"
+description = "Allows processing of photos using a database by reading them from a folder"
+authors = [
+    {name = "Fo3nix",email = "97182469+Fo3nix@users.noreply.github.com"}
+]
+readme = "README.md"
+packages = [
+    { from = ".", include = "*" }
+]
+
+requires-python = ">=3.12"
+dependencies = [
+    "pillow (>=11.3.0,<12.0.0)",
+    "tqdm (>=4.67.1,<5.0.0)",
+    "pillow-heif (>=1.0.0,<2.0.0)",
+    "sqlalchemy (>=2.0.42,<3.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
