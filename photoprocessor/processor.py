@@ -157,7 +157,7 @@ class PhotoProcessor:
             "gps_longitude": google_json.get("geoData", {}).get("longitude"),
         }
 
-    def process(self, filepath):
+    def process(self, filepath, base_path):
         """
         Processes a file and returns a structured dictionary for all database models.
         """
@@ -168,11 +168,45 @@ class PhotoProcessor:
         raw_exif_dict = self._get_raw_exif_dict(filepath)
         google_json_dict = self._get_google_json_dict(filepath)
 
+        file_size = os.path.getsize(filepath)
+
+        base_path = os.path.abspath(base_path)
+        file_name = os.path.basename(filepath)
+
+        relative_path = os.path.relpath(filepath, base_path)
+        relative_path = os.path.dirname(relative_path)
+
+        mime_type = None
+        ext = os.path.splitext(file_name)[1].lower()
+        # possible extensions: ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.heic', '.webp'
+        #                         '.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv')
+        if ext in ['.jpg', '.jpeg']:
+            mime_type = 'image/jpeg'
+        elif ext == '.png':
+            mime_type = 'image/png'
+        elif ext == '.gif':
+            mime_type = 'image/gif'
+        elif ext == '.bmp':
+            mime_type = 'image/bmp'
+        elif ext == '.tiff':
+            mime_type = 'image/tiff'
+        elif ext == '.heic':
+            mime_type = 'image/heic'
+        elif ext == '.webp':
+            mime_type = 'image/webp'
+        elif ext in ['.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv']:
+            mime_type = 'video/' + ext[1:]
+        else:
+            mime_type = 'unknown/unknown'
+
         return {
             "media_file": {
                 "file_hash": file_hash,
-                "filename": os.path.basename(filepath),
-                "relative_path": os.path.dirname(filepath)
+                "filename": file_name,
+                "base_path": base_path,
+                "relative_path": relative_path,
+                "mime_type": mime_type,
+                "file_size": file_size,
             },
             "metadata": self._parse_master_metadata(raw_exif_dict),
             "google_metadata": self._parse_google_metadata(google_json_dict),
