@@ -17,31 +17,23 @@ class PhotoProcessor:
                 sha256_hash.update(byte_block)
         return sha256_hash.hexdigest()
 
-    def _get_exiftool_dict(self, filepath):
+    def _get_exiftool_batch_dict(self, filepaths: list[str]) -> list[dict]:
         """
-        Extracts all metadata from a file using exiftool and returns it as a dictionary.
+        Extracts metadata from a BATCH of files using a single exiftool call.
         """
         try:
-            # -G: Adds group names (e.g., "EXIF", "File") to tag keys for clarity.
-            # -n: Outputs numerical values without formatting (e.g., for GPS).
-            # -json: The crucial flag to get machine-readable output.
-            args = ["exiftool", "-G", "-n", "-json", filepath]
+            # Pass all filepaths to a single exiftool command.
+            # It will return a list of JSON objects, one for each file.
+            args = ["exiftool", "-G", "-n", "-json", *filepaths]
             result = subprocess.run(args, check=True, capture_output=True, text=True)
-
-            # exiftool -json returns a list containing one dictionary for the file.
-            metadata = json.loads(result.stdout)[0]
-            return metadata
-
+            return json.loads(result.stdout)
         except (FileNotFoundError):
-            # This error occurs if 'exiftool' is not installed or not in the system's PATH.
             print("ERROR: exiftool command not found. Please install it and ensure it's in your PATH.")
-            # We can raise the exception to stop the script, as it's a critical dependency.
             raise
-        except (subprocess.CalledProcessError, IndexError, json.JSONDecodeError) as e:
-            # Handles cases where exiftool fails, returns no data, or returns malformed JSON.
-            # You might want to log this error for debugging.
-            print(f"Warning: Could not get exiftool data for {os.path.basename(filepath)}: {e}")
-            return None
+        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+            print(f"Warning: Could not get exiftool data for a batch: {e}")
+            # Return an empty list of the same size so the caller can map results.
+            return [{} for _ in filepaths]
 
     def _get_google_json_dict(self, image_path):
         """
@@ -143,53 +135,36 @@ class PhotoProcessor:
             "gps_longitude": google_json.get("geoData", {}).get("longitude"),
         }
 
-    def process(self, filepath):
+    def process_batch(self, filepaths: list[str]) -> dict[str, dict]:
         """
-        Processes a file and returns a structured dictionary for all database models.
+        Processes a BATCH of files and returns a dictionary mapping
+        filepath -> structured data.
         """
-        if not os.path.exists(filepath):
-            return None
+        results = {}
+        # Get all exif data in one shot
+        all_raw_exif = self._get_exiftool_batch_dict(filepaths)
 
-        file_hash = self._hash_file_content(filepath)
-        raw_exif_dict = self._get_exiftool_dict(filepath)
-        google_json_dict = self._get_google_json_dict(filepath)
+        # Create a map of SourceFile -> exif_data for easy lookup
+        exif_map = {os.path.abspath(d.get('SourceFile')): d for d in all_raw_exif}
 
-        file_size = os.path.getsize(filepath)
+        for filepath in filepaths:
+            if not os.path.exists(filepath):
+                continue
 
-        file_name = os.path.basename(filepath)
-        mime_type = None
-        ext = os.path.splitext(file_name)[1].lower()
+            raw_exif_dict = exif_map.get(filepath)
+            mime_type = raw_exif_dict.get("File:MIMEType", "unknown/unknown") if raw_exif_dict else "unknown/unknown"
 
-        try:
-            mime_type = magic.from_file(filepath, mime=True)
-        except Exception as e:
-            if ext in ['.jpg', '.jpeg']:
-                mime_type = 'image/jpeg'
-            elif ext == '.png':
-                mime_type = 'image/png'
-            elif ext == '.gif':
-                mime_type = 'image/gif'
-            elif ext == '.bmp':
-                mime_type = 'image/bmp'
-            elif ext == '.tiff':
-                mime_type = 'image/tiff'
-            elif ext == '.heic':
-                mime_type = 'image/heic'
-            elif ext == '.webp':
-                mime_type = 'image/webp'
-            elif ext in ['.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv']:
-                mime_type = 'video/' + ext[1:]
-            else:
-                mime_type = 'unknown/unknown'
+            google_json_dict = self._get_google_json_dict(filepath)
 
-        return {
-            "media_file": {
-                "file_hash": file_hash,
-                "mime_type": mime_type,
-                "file_size": file_size,
-            },
-            "metadata": self._parse_master_metadata(raw_exif_dict),
-            "google_metadata": self._parse_google_metadata(google_json_dict),
-            "raw_exif": {"data": raw_exif_dict} if raw_exif_dict else None,
-            "raw_google_json": {"data": google_json_dict} if google_json_dict else None
-        }
+            results[filepath] = {
+                "media_file": {
+                    "file_hash": self._hash_file_content(filepath),  # Hashing must still be one-by-one
+                    "mime_type": mime_type,
+                    "file_size": raw_exif_dict.get("File:FileSize", 0) if raw_exif_dict else os.path.getsize(filepath),
+                },
+                "metadata": self._parse_master_metadata(raw_exif_dict),
+                "google_metadata": self._parse_google_metadata(google_json_dict),
+                "raw_exif": {"data": raw_exif_dict} if raw_exif_dict else None,
+                "raw_google_json": {"data": google_json_dict} if google_json_dict else None
+            }
+        return results

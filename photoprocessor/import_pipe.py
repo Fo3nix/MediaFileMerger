@@ -135,18 +135,16 @@ def process_batch(db: Session, processor: PhotoProcessor, paths: List[str], owne
     inserted, merged = 0, 0
     failures = []
 
-    # --- Step 1: Process all files in batch to get their data and hashes ---
-    processed_data_map = {}
-    hashes_to_check = set()
-    for path in paths:
-        data = processor.process(path)
-        if data and "media_file" in data:
-            file_hash = data["media_file"]["file_hash"]
-            processed_data_map[os.path.abspath(path)] = data
-            hashes_to_check.add(file_hash)
+    # --- Step 1: Process all files in the batch with ONE call ---
+    batch_data = processor.process_batch([os.path.abspath(p) for p in paths])
 
-    if not hashes_to_check:
+    if not batch_data:
         return 0, 0, []
+
+    hashes_to_check = {
+        item["media_file"]["file_hash"]
+        for item in batch_data.values() if item and "media_file" in item
+    }
 
     # --- Step 2: Find all existing MediaFile objects matching these hashes ---
     existing_media_files = {
@@ -157,7 +155,7 @@ def process_batch(db: Session, processor: PhotoProcessor, paths: List[str], owne
     }
 
     # --- Step 3: Iterate and decide to INSERT or MERGE atomically per file ---
-    for location, data in processed_data_map.items():
+    for location, data in batch_data.items():
         try:
             # Use a nested transaction (SAVEPOINT) for each file.
             # If an exception is raised inside, only this file's changes are rolled back.
