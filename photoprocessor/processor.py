@@ -107,19 +107,34 @@ class PhotoProcessor:
             return None
 
         return {
-            "description": self._get_optional(raw_exif, ["XMP:Description", "EXIF:ImageDescription"]),
-            "date_taken": self._to_datetime(self._get_optional(raw_exif, [("EXIF:DateTimeOriginal", "EXIF:OffsetTimeOriginal"), "QuickTime:CreateDate", "EXIF:CreateDate"])),
-            "camera_make": self._get_optional(raw_exif, ["EXIF:Make"]),
-            "camera_model": self._get_optional(raw_exif, ["EXIF:Model"]),
-            "lens_model": self._get_optional(raw_exif, ["EXIF:LensModel"]),
-            "focal_length": self._get_optional(raw_exif, ["EXIF:FocalLength"]),
-            "aperture": self._get_optional(raw_exif, ["EXIF:FNumber"]),
-            "iso": self._get_optional(raw_exif, ["EXIF:ISO"]),
-            "width": self._get_optional(raw_exif, ["File:ImageWidth"]),
-            "height": self._get_optional(raw_exif, ["File:ImageHeight"]),
-            "duration_seconds": self._get_optional(raw_exif, ["QuickTime:Duration"]),  # For videos!
-            "gps_latitude": self._get_optional(raw_exif, ["EXIF:GPSLatitude"]),
-            "gps_longitude": self._get_optional(raw_exif, ["EXIF:GPSLongitude"]),
+            # Added IPTC tag, a common standard for captions.
+            "description": self._get_optional(raw_exif,
+                                              ["XMP:Description", "IPTC:Caption-Abstract", "EXIF:ImageDescription"]),
+
+            # Added XMP and File system dates as fallbacks.
+            "date_taken": self._to_datetime(self._get_optional(raw_exif, [
+                ("EXIF:DateTimeOriginal", "EXIF:OffsetTimeOriginal"),
+                "XMP:DateTimeOriginal",
+                "QuickTime:CreateDate",
+                "EXIF:CreateDate",
+                "File:FileModifyDate"
+            ])),
+
+            "camera_make": self._get_optional(raw_exif, ["EXIF:Make", "XMP:Make"]),
+            "camera_model": self._get_optional(raw_exif, ["EXIF:Model", "XMP:Model"]),
+            "lens_model": self._get_optional(raw_exif, ["EXIF:LensModel", "XMP:Lens"]),
+
+            "focal_length": self._get_optional(raw_exif, ["EXIF:FocalLength", "XMP:FocalLength"]),
+            "aperture": self._get_optional(raw_exif, ["EXIF:FNumber", "XMP:FNumber"]),
+            "iso": self._get_optional(raw_exif, ["EXIF:ISO", "XMP:ISO"]),
+
+            "width": self._get_optional(raw_exif, ["EXIF:ImageWidth", "File:ImageWidth", "QuickTime:ImageWidth"]),
+            "height": self._get_optional(raw_exif, ["EXIF:ImageHeight", "File:ImageHeight", "QuickTime:ImageHeight"]),
+
+            "duration_seconds": self._get_optional(raw_exif, ["QuickTime:Duration"]),
+
+            "gps_latitude": self._get_optional(raw_exif, ["EXIF:GPSLatitude", "Composite:GPSLatitude"]),
+            "gps_longitude": self._get_optional(raw_exif, ["EXIF:GPSLongitude", "Composite:GPSLongitude"]),
         }
 
     def _get_optional(self, data_dict, keys):
