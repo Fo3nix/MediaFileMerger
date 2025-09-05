@@ -24,7 +24,13 @@ class PhotoProcessor:
         try:
             # Pass all filepaths to a single exiftool command.
             # It will return a list of JSON objects, one for each file.
-            args = ["exiftool", "-G", "-n", "-json", *filepaths]
+            args = [
+                "exiftool",
+                "-api", "QuickTimeUTC",  # ADDED: Essential for correct video time conversion
+                "-d", "%Y-%m-%dT%H:%M:%S%:z",  # This format is correct
+                "-G", "-n", "-json",
+                *filepaths
+            ]
             result = subprocess.run(args, check=True, capture_output=True, text=True)
             return json.loads(result.stdout)
         except (FileNotFoundError):
@@ -77,46 +83,60 @@ class PhotoProcessor:
         return merged_data if merged_data else None
 
     def _to_datetime(self, date_str):
-        """Safely converts a string to a datetime object from common formats."""
+        print(f"Converting date string: {date_str}")
+        """Safely converts a timezone-aware string to a datetime object."""
         if not date_str or not isinstance(date_str, str):
             return None
+
+        # --- CORRECTION ---
+        # The primary method should be datetime.fromisoformat(), which is
+        # designed to parse the "YYYY-MM-DD HH:MM:SS+HH:MM" string.
         try:
-            return datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
-        except ValueError:
-            try:
-                if date_str.endswith('Z'):
-                    date_str = date_str[:-1] + '+00:00'
-                return datetime.fromisoformat(date_str)
-            except ValueError:
-                return None
+            # Replace spaces with 'T' for strict ISO 8601 compatibility if needed,
+            # though fromisoformat is often flexible. A simple replace is robust.
+            iso_str = date_str.replace(" ", "T")
+            iso_str = iso_str.replace(':', '-', 2)
+            return datetime.fromisoformat(iso_str)
+        except (ValueError, TypeError):
+            print(f"Warning: Could not parse date string: {date_str}")
+            return None
 
     def _parse_master_metadata(self, raw_exif):
         """Parses raw EXIF data from EXIFTOOL into the format for the 'Metadata' table."""
         if not raw_exif:
             return None
 
-        # Note the new keys with group names like "EXIF:" and "File:"
-        # We check multiple tags for some fields, as they can exist in different places.
-        date_taken_str = raw_exif.get("EXIF:DateTimeOriginal") or \
-                         raw_exif.get("QuickTime:CreateDate") or \
-                         raw_exif.get("EXIF:CreateDate")
-
         return {
-            "description": raw_exif.get("XMP:Description") or raw_exif.get("EXIF:ImageDescription"),
-            "date_taken": self._to_datetime(date_taken_str),
-            "camera_make": raw_exif.get("EXIF:Make"),
-            "camera_model": raw_exif.get("EXIF:Model"),
-            "lens_model": raw_exif.get("EXIF:LensModel"),
-            "focal_length": raw_exif.get("EXIF:FocalLength"),
-            "aperture": raw_exif.get("EXIF:FNumber"),
-            "iso": raw_exif.get("EXIF:ISO"),
-            "width": raw_exif.get("File:ImageWidth"),
-            "height": raw_exif.get("File:ImageHeight"),
-            "duration_seconds": raw_exif.get("QuickTime:Duration"),  # For videos!
-            "gps_latitude": raw_exif.get("EXIF:GPSLatitude"),
-            "gps_longitude": raw_exif.get("EXIF:GPSLongitude"),
-            "rating": raw_exif.get("XMP:Rating"),
+            "description": self._get_optional(raw_exif, ["XMP:Description", "EXIF:ImageDescription"]),
+            "date_taken": self._to_datetime(self._get_optional(raw_exif, [("EXIF:DateTimeOriginal", "EXIF:OffsetTimeOriginal"), "QuickTime:CreateDate", "EXIF:CreateDate"])),
+            "camera_make": self._get_optional(raw_exif, ["EXIF:Make"]),
+            "camera_model": self._get_optional(raw_exif, ["EXIF:Model"]),
+            "lens_model": self._get_optional(raw_exif, ["EXIF:LensModel"]),
+            "focal_length": self._get_optional(raw_exif, ["EXIF:FocalLength"]),
+            "aperture": self._get_optional(raw_exif, ["EXIF:FNumber"]),
+            "iso": self._get_optional(raw_exif, ["EXIF:ISO"]),
+            "width": self._get_optional(raw_exif, ["File:ImageWidth"]),
+            "height": self._get_optional(raw_exif, ["File:ImageHeight"]),
+            "duration_seconds": self._get_optional(raw_exif, ["QuickTime:Duration"]),  # For videos!
+            "gps_latitude": self._get_optional(raw_exif, ["EXIF:GPSLatitude"]),
+            "gps_longitude": self._get_optional(raw_exif, ["EXIF:GPSLongitude"]),
         }
+
+    def _get_optional(self, data_dict, keys):
+        """Helper function to get in-order keys from a dictionary, or combinations of keys.
+            keys is a list of str or tuple of str.
+        """
+        for key in keys:
+            if isinstance(key, str):
+                if key in data_dict:
+                    return data_dict[key]
+            elif isinstance(key, tuple):
+                # Check if all keys in the tuple exist
+                if all(k in data_dict for k in key):
+                    # Return a combined value (e.g., date + offset)
+                    return ''.join(str(data_dict[k]) for k in key)
+        return None
+
 
     def _parse_google_metadata(self, google_json):
         """Parses Google JSON data for the 'GooglePhotosMetadata' table."""

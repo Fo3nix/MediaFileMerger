@@ -1,7 +1,42 @@
 from sqlalchemy import Column, Integer, String, REAL, DateTime, ForeignKey, JSON, Boolean, UniqueConstraint
 from sqlalchemy.orm import relationship
 from photoprocessor.database import Base  # Import Base from your database module
+from sqlalchemy.types import TypeDecorator
+import datetime
 
+
+## CUSTOM TYPES
+class AwareDateTime(TypeDecorator):
+    """
+    A custom SQLAlchemy type to store timezone-aware datetime objects in SQLite.
+
+    Stores as a TEXT column in ISO 8601 format with timezone.
+    e.g., "2025-09-05T23:01:31+02:00"
+    """
+    impl = String  # The underlying database type is TEXT (String)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        # This is called when sending data TO the database.
+        if value is None:
+            return None
+        if not isinstance(value, datetime.datetime):
+            raise TypeError("AwareDateTime column requires datetime objects")
+        if value.tzinfo is None:
+            raise ValueError("datetime object must be timezone-aware")
+
+        # Convert the datetime object to a standard ISO 8601 string.
+        return value.isoformat()
+
+    def process_result_value(self, value, dialect):
+        # This is called when receiving data FROM the database.
+        if value is None:
+            return None
+
+        # Parse the ISO 8601 string back into a timezone-aware datetime object.
+        return datetime.fromisoformat(value)
+
+## DATABASE MODELS
 
 class Owner(Base):
     """
@@ -72,7 +107,7 @@ class Metadata(Base):
 
     title = Column(String)
     description = Column(String)
-    date_taken = Column(DateTime)
+    date_taken = Column(AwareDateTime)
     camera_make = Column(String)
     camera_model = Column(String)
     lens_model = Column(String)
