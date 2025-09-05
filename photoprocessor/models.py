@@ -3,29 +3,64 @@ from sqlalchemy.orm import relationship
 from photoprocessor.database import Base  # Import Base from your database module
 
 
-class MediaFile(Base):
-    __tablename__ = 'media_files'
+class Owner(Base):
+    """
+    Represents an owner of a media file. Storing owners separately
+    prevents data duplication (e.g., spelling a name differently)
+    and normalizes the database structure.
+    """
+    __tablename__ = 'owners'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(20), unique=True, nullable=False, index=True)
+
+    # Links this owner to their entries in the MediaOwnership association table.
+    ownership_records = relationship("MediaOwnership", back_populates="owner")
+
+
+class MediaOwnership(Base):
+    """
+    This is an 'association object' that connects MediaFile and Owner.
+    It creates the many-to-many relationship and stores additional data
+    about that relationship—specifically, the 'location' of that file instance.
+    """
+    __tablename__ = 'media_ownership'
     __table_args__ = (
-        # Ensures that you cannot have the same file path registered more than once.
-        UniqueConstraint('base_path', 'relative_path', 'filename', name='uq_filepath'),
+        # A specific file can only be owned by a specific person at a specific location once.
+        UniqueConstraint('media_file_id', 'owner_id', 'location', name='uq_owner_file_location'),
     )
 
     id = Column(Integer, primary_key=True, index=True)
-    # The 'unique' constraint is removed to allow for duplicate images (e.g., in different albums/locations).
-    file_hash = Column(String, nullable=False, index=True)
+    media_file_id = Column(Integer, ForeignKey('media_files.id'), nullable=False)
+    owner_id = Column(Integer, ForeignKey('owners.id'), nullable=False)
+    location = Column(String, nullable=False, index=True)  # File path for this instance
     filename = Column(String, nullable=False)
-    relative_path = Column(String, nullable=False)  # Relative path from the base path
-    base_path = Column(String, nullable=False)
-    mime_type = Column(String, nullable=False)  # e.g., 'image/jpeg', 'video/mp4'
-    file_size = Column(Integer, nullable=False)  # Size in bytes
 
-    # Relationships remain the same, SQLAlchemy handles the join condition via the ForeignKey.
+    # Relationships back to the parent tables
+    media_file = relationship("MediaFile", back_populates="owners")
+    owner = relationship("Owner", back_populates="ownership_records")
+
+class MediaFile(Base):
+    __tablename__ = 'media_files'
+    # __table_args__ is removed as the file path constraint is no longer here.
+
+    id = Column(Integer, primary_key=True, index=True)
+    # MODIFIED: file_hash is now unique. This table now stores a single record
+    # for each unique piece of media content.
+    file_hash = Column(String, nullable=False, index=True, unique=True)
+    # REMOVED: 'relative_path' and 'base_path' are now in the MediaOwnership table.
+    mime_type = Column(String, nullable=False)
+    file_size = Column(Integer, nullable=False)
+
+    # ADDED: Relationship to the MediaOwnership association table.
+    owners = relationship("MediaOwnership", back_populates="media_file", cascade="all, delete-orphan")
+
+    # Unchanged Relationships
     processed_metadata = relationship("Metadata", back_populates="media_file", uselist=False,
                                       cascade="all, delete-orphan")
     google_metadata = relationship("GooglePhotosMetadata", uselist=False, cascade="all, delete-orphan")
-    raw_exif = relationship("RawExif", uselist=False, cascade="all, delete-orphan")
-    raw_google_json = relationship("RawGoogleJson", uselist=False, cascade="all, delete-orphan")
-
+    raw_exif = relationship("RawExif", cascade="all, delete-orphan")
+    raw_google_json = relationship("RawGoogleJson", cascade="all, delete-orphan")
 
 class Metadata(Base):
     __tablename__ = 'metadata'
@@ -79,8 +114,8 @@ class GooglePhotosMetadata(Base):
 class RawExif(Base):
     __tablename__ = 'raw_exif'
 
-    # The media file's ID is now the primary key.
-    media_file_id = Column(Integer, ForeignKey('media_files.id'), primary_key=True)
+    id = Column(Integer, primary_key=True)
+    media_file_id = Column(Integer, ForeignKey('media_files.id'), nullable=False, index=True)
     data = Column(JSON, nullable=False)
 
     media_file = relationship("MediaFile", back_populates="raw_exif")
@@ -89,8 +124,8 @@ class RawExif(Base):
 class RawGoogleJson(Base):
     __tablename__ = 'raw_google_json'
 
-    # The media file's ID is now the primary key.
-    media_file_id = Column(Integer, ForeignKey('media_files.id'), primary_key=True)
+    id = Column(Integer, primary_key=True)
+    media_file_id = Column(Integer, ForeignKey('media_files.id'), nullable=False, index=True)
     data = Column(JSON, nullable=False)
 
     media_file = relationship("MediaFile", back_populates="raw_google_json")

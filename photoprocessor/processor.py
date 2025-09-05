@@ -1,17 +1,9 @@
 import hashlib
+import subprocess
 import json
 import os
 from datetime import datetime
-from PIL import Image
-from PIL.ExifTags import TAGS
-
-# For HEIC support
-try:
-    from pillow_heif import register_heif_opener
-
-    register_heif_opener()
-except ImportError:
-    pass
+import magic
 
 
 class PhotoProcessor:
@@ -25,47 +17,30 @@ class PhotoProcessor:
                 sha256_hash.update(byte_block)
         return sha256_hash.hexdigest()
 
-    def _get_raw_exif_dict(self, filepath):
+    def _get_exiftool_dict(self, filepath):
         """
-        Extracts EXIF data robustly, checking multiple sources within the image file,
-        and returns a clean dictionary.
+        Extracts all metadata from a file using exiftool and returns it as a dictionary.
         """
         try:
-            with Image.open(filepath) as img:
-                exif_data_dict = {}
+            # -G: Adds group names (e.g., "EXIF", "File") to tag keys for clarity.
+            # -n: Outputs numerical values without formatting (e.g., for GPS).
+            # -json: The crucial flag to get machine-readable output.
+            args = ["exiftool", "-G", "-n", "-json", filepath]
+            result = subprocess.run(args, check=True, capture_output=True, text=True)
 
-                # Load EXIF data, checking both primary and info attributes
-                exif = img.getexif()
-                if not exif and 'exif' in img.info:
-                    exif = Image.Exif()
-                    exif.load(img.info['exif'])
+            # exiftool -json returns a list containing one dictionary for the file.
+            metadata = json.loads(result.stdout)[0]
+            return metadata
 
-                # Process the main EXIF block with improved filtering
-                if exif:
-                    for tag_id, value in exif.items():
-                        tag_name = TAGS.get(tag_id, str(tag_id))
-                        if isinstance(value, bytes):
-                            # Decode, then strip whitespace and null characters
-                            decoded_value = value.decode('utf-8', 'ignore').strip().strip('\x00')
-                            if decoded_value and decoded_value.isprintable():
-                                exif_data_dict[tag_name] = decoded_value
-                        elif isinstance(value, (int, float, str)):
-                            exif_data_dict[tag_name] = value
-
-                # Process other .info items for additional metadata (like DPI)
-                for key, value in img.info.items():
-                    if key != 'exif':  # Skip the raw block we already processed
-                        if isinstance(value, (int, float, str)):
-                            exif_data_dict[key] = value
-                        elif isinstance(value, tuple):
-                            exif_data_dict[key] = str(value)
-
-                # Also include basic image info
-                exif_data_dict['width'] = img.width
-                exif_data_dict['height'] = img.height
-
-                return exif_data_dict if exif_data_dict else None
-        except Exception:
+        except (FileNotFoundError):
+            # This error occurs if 'exiftool' is not installed or not in the system's PATH.
+            print("ERROR: exiftool command not found. Please install it and ensure it's in your PATH.")
+            # We can raise the exception to stop the script, as it's a critical dependency.
+            raise
+        except (subprocess.CalledProcessError, IndexError, json.JSONDecodeError) as e:
+            # Handles cases where exiftool fails, returns no data, or returns malformed JSON.
+            # You might want to log this error for debugging.
+            print(f"Warning: Could not get exiftool data for {os.path.basename(filepath)}: {e}")
             return None
 
     def _get_google_json_dict(self, image_path):
@@ -124,20 +99,31 @@ class PhotoProcessor:
                 return None
 
     def _parse_master_metadata(self, raw_exif):
-        """Parses raw EXIF data into the format for the main 'Metadata' table."""
+        """Parses raw EXIF data from EXIFTOOL into the format for the 'Metadata' table."""
         if not raw_exif:
             return None
+
+        # Note the new keys with group names like "EXIF:" and "File:"
+        # We check multiple tags for some fields, as they can exist in different places.
+        date_taken_str = raw_exif.get("EXIF:DateTimeOriginal") or \
+                         raw_exif.get("QuickTime:CreateDate") or \
+                         raw_exif.get("EXIF:CreateDate")
+
         return {
-            "description": raw_exif.get("ImageDescription"),
-            "date_taken": self._to_datetime(raw_exif.get("DateTimeOriginal") or raw_exif.get("DateTime")),
-            "camera_make": raw_exif.get("Make"),
-            "camera_model": raw_exif.get("Model"),
-            "lens_model": raw_exif.get("LensModel"),
-            "focal_length": raw_exif.get("FocalLength"),
-            "aperture": raw_exif.get("FNumber"),
-            "iso": raw_exif.get("ISOSpeedRatings"),
-            "width": raw_exif.get("width"),
-            "height": raw_exif.get("height"),
+            "description": raw_exif.get("XMP:Description") or raw_exif.get("EXIF:ImageDescription"),
+            "date_taken": self._to_datetime(date_taken_str),
+            "camera_make": raw_exif.get("EXIF:Make"),
+            "camera_model": raw_exif.get("EXIF:Model"),
+            "lens_model": raw_exif.get("EXIF:LensModel"),
+            "focal_length": raw_exif.get("EXIF:FocalLength"),
+            "aperture": raw_exif.get("EXIF:FNumber"),
+            "iso": raw_exif.get("EXIF:ISO"),
+            "width": raw_exif.get("File:ImageWidth"),
+            "height": raw_exif.get("File:ImageHeight"),
+            "duration_seconds": raw_exif.get("QuickTime:Duration"),  # For videos!
+            "gps_latitude": raw_exif.get("EXIF:GPSLatitude"),
+            "gps_longitude": raw_exif.get("EXIF:GPSLongitude"),
+            "rating": raw_exif.get("XMP:Rating"),
         }
 
     def _parse_google_metadata(self, google_json):
@@ -157,7 +143,7 @@ class PhotoProcessor:
             "gps_longitude": google_json.get("geoData", {}).get("longitude"),
         }
 
-    def process(self, filepath, base_path):
+    def process(self, filepath):
         """
         Processes a file and returns a structured dictionary for all database models.
         """
@@ -165,46 +151,40 @@ class PhotoProcessor:
             return None
 
         file_hash = self._hash_file_content(filepath)
-        raw_exif_dict = self._get_raw_exif_dict(filepath)
+        raw_exif_dict = self._get_exiftool_dict(filepath)
         google_json_dict = self._get_google_json_dict(filepath)
 
         file_size = os.path.getsize(filepath)
 
-        base_path = os.path.abspath(base_path)
         file_name = os.path.basename(filepath)
-
-        relative_path = os.path.relpath(filepath, base_path)
-        relative_path = os.path.dirname(relative_path)
-
         mime_type = None
         ext = os.path.splitext(file_name)[1].lower()
-        # possible extensions: ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.heic', '.webp'
-        #                         '.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv')
-        if ext in ['.jpg', '.jpeg']:
-            mime_type = 'image/jpeg'
-        elif ext == '.png':
-            mime_type = 'image/png'
-        elif ext == '.gif':
-            mime_type = 'image/gif'
-        elif ext == '.bmp':
-            mime_type = 'image/bmp'
-        elif ext == '.tiff':
-            mime_type = 'image/tiff'
-        elif ext == '.heic':
-            mime_type = 'image/heic'
-        elif ext == '.webp':
-            mime_type = 'image/webp'
-        elif ext in ['.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv']:
-            mime_type = 'video/' + ext[1:]
-        else:
-            mime_type = 'unknown/unknown'
+
+        try:
+            mime_type = magic.from_file(filepath, mime=True)
+        except Exception as e:
+            if ext in ['.jpg', '.jpeg']:
+                mime_type = 'image/jpeg'
+            elif ext == '.png':
+                mime_type = 'image/png'
+            elif ext == '.gif':
+                mime_type = 'image/gif'
+            elif ext == '.bmp':
+                mime_type = 'image/bmp'
+            elif ext == '.tiff':
+                mime_type = 'image/tiff'
+            elif ext == '.heic':
+                mime_type = 'image/heic'
+            elif ext == '.webp':
+                mime_type = 'image/webp'
+            elif ext in ['.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv']:
+                mime_type = 'video/' + ext[1:]
+            else:
+                mime_type = 'unknown/unknown'
 
         return {
             "media_file": {
                 "file_hash": file_hash,
-                "filename": file_name,
-                "base_path": base_path,
-                "relative_path": relative_path,
                 "mime_type": mime_type,
                 "file_size": file_size,
             },
