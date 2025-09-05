@@ -116,18 +116,17 @@ def write_metadata_with_exiftool(filepath: str, metadata: Dict, date_taken: date
 
     # Map our merged data keys to ExifTool tag names
     tag_map = {
-        "title": "-XMP:Title",
-        "description": "-XMP:Description",
+        "title": "-Title",
+        "description": "-Description",
         "date_taken": "-AllDates",  # Sets EXIF:DateTimeOriginal, CreateDate, and ModifyDate
         "gps_latitude": "-GPSLatitude",
         "gps_longitude": "-GPSLongitude",
-        "camera_make": "-EXIF:Make",
-        "camera_model": "-EXIF:Model",
-        "lens_model": "-EXIF:LensModel",
-        "aperture": "-EXIF:FNumber",
-        "focal_length": "-EXIF:FocalLength",
-        "iso": "-EXIF:ISO",
-        "is_favorite": "-XMP:Rating",  # Use rating for favorite (e.g., 5 stars)
+        "camera_make": "-Make",
+        "camera_model": "-Model",
+        "lens_model": "-LensModel",
+        "aperture": "-FNumber",
+        "focal_length": "-FocalLength",
+        "iso": "-ISO",
     }
 
     for key, value in metadata.items():
@@ -137,9 +136,7 @@ def write_metadata_with_exiftool(filepath: str, metadata: Dict, date_taken: date
             value = value.replace('\x00', '')
 
         if key in tag_map:
-            if key == 'is_favorite' and value:
-                args.append(f"{tag_map[key]}=5")
-            elif key == 'date_taken':
+            if key == 'date_taken':
                 # Format datetime for exiftool
                 args.append(f"{tag_map[key]}={value.strftime('%Y:%m:%d %H:%M:%S')}")
             else:
