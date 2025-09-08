@@ -34,7 +34,7 @@ class AwareDateTime(TypeDecorator):
             return None
 
         # Parse the ISO 8601 string back into a timezone-aware datetime object.
-        return datetime.fromisoformat(value)
+        return datetime.datetime.fromisoformat(value)
 
 ## DATABASE MODELS
 class Owner(Base):

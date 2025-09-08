@@ -2,7 +2,7 @@ import hashlib
 import subprocess
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import magic
 
 
@@ -134,8 +134,9 @@ class PhotoProcessor:
         if not google_json:
             return None
         creation_time = google_json.get("photoTakenTime", {}).get("timestamp")
+        date_obj = datetime.fromtimestamp(int(creation_time), tz=timezone.utc) if creation_time else None
         return {
-            "date_taken": datetime.fromtimestamp(int(creation_time)) if creation_time else None,
+            "date_taken": date_obj,
             "gps_latitude": google_json.get("geoData", {}).get("latitude"),
             "gps_longitude": google_json.get("geoData", {}).get("longitude"),
         }
