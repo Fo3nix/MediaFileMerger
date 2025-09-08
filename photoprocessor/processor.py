@@ -114,7 +114,9 @@ class PhotoProcessor:
         - If the object is already aware (e.g., in UTC), it is converted to the target timezone.
         """
         # If we don't have a datetime or coordinates, we can't proceed.
-        if not dt_obj or lat is None or lon is None:
+        if not dt_obj:
+            return None
+        if lat is None or lon is None:
             if dt_obj.tzinfo is None:
                 return None
 
