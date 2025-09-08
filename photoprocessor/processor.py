@@ -101,42 +101,6 @@ class PhotoProcessor:
             print(f"Warning: Could not parse date string: {date_str}")
             return None
 
-    def _parse_master_metadata(self, raw_exif):
-        """Parses raw EXIF data from EXIFTOOL into the format for the 'Metadata' table."""
-        if not raw_exif:
-            return None
-
-        return {
-            # Added IPTC tag, a common standard for captions.
-            "description": self._get_optional(raw_exif,
-                                              ["XMP:Description", "IPTC:Caption-Abstract", "EXIF:ImageDescription"]),
-
-            # Added XMP and File system dates as fallbacks.
-            "date_taken": self._to_datetime(self._get_optional(raw_exif, [
-                ("EXIF:DateTimeOriginal", "EXIF:OffsetTimeOriginal"),
-                "XMP:DateTimeOriginal",
-                "QuickTime:CreateDate",
-                "EXIF:CreateDate",
-                "File:FileModifyDate"
-            ])),
-
-            "camera_make": self._get_optional(raw_exif, ["EXIF:Make", "XMP:Make"]),
-            "camera_model": self._get_optional(raw_exif, ["EXIF:Model", "XMP:Model"]),
-            "lens_model": self._get_optional(raw_exif, ["EXIF:LensModel", "XMP:Lens"]),
-
-            "focal_length": self._get_optional(raw_exif, ["EXIF:FocalLength", "XMP:FocalLength"]),
-            "aperture": self._get_optional(raw_exif, ["EXIF:FNumber", "XMP:FNumber"]),
-            "iso": self._get_optional(raw_exif, ["EXIF:ISO", "XMP:ISO"]),
-
-            "width": self._get_optional(raw_exif, ["EXIF:ImageWidth", "File:ImageWidth", "QuickTime:ImageWidth"]),
-            "height": self._get_optional(raw_exif, ["EXIF:ImageHeight", "File:ImageHeight", "QuickTime:ImageHeight"]),
-
-            "duration_seconds": self._get_optional(raw_exif, ["QuickTime:Duration"]),
-
-            "gps_latitude": self._get_optional(raw_exif, ["EXIF:GPSLatitude", "Composite:GPSLatitude"]),
-            "gps_longitude": self._get_optional(raw_exif, ["EXIF:GPSLongitude", "Composite:GPSLongitude"]),
-        }
-
     def _get_optional(self, data_dict, keys):
         """Helper function to get in-order keys from a dictionary, or combinations of keys.
             keys is a list of str or tuple of str.
@@ -152,20 +116,26 @@ class PhotoProcessor:
                     return ''.join(str(data_dict[k]) for k in key)
         return None
 
+    def _parse_key_exif_fields(self, raw_exif):
+        """Extracts just the key fields needed for the unified Metadata table."""
+        if not raw_exif:
+            return None
+        return {
+            "date_taken": self._to_datetime(self._get_optional(raw_exif, [
+                ("EXIF:DateTimeOriginal", "EXIF:OffsetTimeOriginal"),
+                "XMP:DateTimeOriginal", "QuickTime:CreateDate", "EXIF:CreateDate", "File:FileModifyDate"
+            ])),
+            "gps_latitude": self._get_optional(raw_exif, ["EXIF:GPSLatitude", "Composite:GPSLatitude"]),
+            "gps_longitude": self._get_optional(raw_exif, ["EXIF:GPSLongitude", "Composite:GPSLongitude"]),
+        }
 
-    def _parse_google_metadata(self, google_json):
-        """Parses Google JSON data for the 'GooglePhotosMetadata' table."""
+    def _parse_key_google_fields(self, google_json):
+        """Extracts just the key fields from Google JSON."""
         if not google_json:
             return None
         creation_time = google_json.get("photoTakenTime", {}).get("timestamp")
-        modified_time = google_json.get("photoLastModifiedTime", {}).get("timestamp")
         return {
-            "title": google_json.get("title"),
-            "description": google_json.get("description"),
-            "creation_timestamp": datetime.fromtimestamp(int(creation_time)) if creation_time else None,
-            "modified_timestamp": datetime.fromtimestamp(int(modified_time)) if modified_time else None,
-            "google_url": google_json.get("url"),
-            "is_favorited": google_json.get("favorited", False),
+            "date_taken": datetime.fromtimestamp(int(creation_time)) if creation_time else None,
             "gps_latitude": google_json.get("geoData", {}).get("latitude"),
             "gps_longitude": google_json.get("geoData", {}).get("longitude"),
         }
@@ -176,10 +146,7 @@ class PhotoProcessor:
         filepath -> structured data.
         """
         results = {}
-        # Get all exif data in one shot
         all_raw_exif = self._get_exiftool_batch_dict(filepaths)
-
-        # Create a map of SourceFile -> exif_data for easy lookup
         exif_map = {os.path.abspath(d.get('SourceFile')): d for d in all_raw_exif}
 
         for filepath in filepaths:
@@ -187,19 +154,22 @@ class PhotoProcessor:
                 continue
 
             raw_exif_dict = exif_map.get(filepath)
-            mime_type = raw_exif_dict.get("File:MIMEType", "unknown/unknown") if raw_exif_dict else "unknown/unknown"
-
             google_json_dict = self._get_google_json_dict(filepath)
 
+            # The new structure separates data by its source
             results[filepath] = {
                 "media_file": {
-                    "file_hash": self._hash_file_content(filepath),  # Hashing must still be one-by-one
-                    "mime_type": mime_type,
+                    "file_hash": self._hash_file_content(filepath),
+                    "mime_type": raw_exif_dict.get("File:MIMEType", "unknown/unknown") if raw_exif_dict else "unknown/unknown",
                     "file_size": raw_exif_dict.get("File:FileSize", 0) if raw_exif_dict else os.path.getsize(filepath),
                 },
-                "metadata": self._parse_master_metadata(raw_exif_dict),
-                "google_metadata": self._parse_google_metadata(google_json_dict),
-                "raw_exif": {"data": raw_exif_dict} if raw_exif_dict else None,
-                "raw_google_json": {"data": google_json_dict} if google_json_dict else None
+                "exif_metadata": {
+                    "parsed": self._parse_key_exif_fields(raw_exif_dict),
+                    "raw": raw_exif_dict
+                } if raw_exif_dict else None,
+                "google_metadata": {
+                    "parsed": self._parse_key_google_fields(google_json_dict),
+                    "raw": google_json_dict
+                } if google_json_dict else None
             }
         return results

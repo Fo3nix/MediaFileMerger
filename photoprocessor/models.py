@@ -37,130 +37,90 @@ class AwareDateTime(TypeDecorator):
         return datetime.fromisoformat(value)
 
 ## DATABASE MODELS
-
 class Owner(Base):
-    """
-    Represents an owner of a media file. Storing owners separately
-    prevents data duplication (e.g., spelling a name differently)
-    and normalizes the database structure.
-    """
+    """Represents an owner. Links to locations via MediaOwnership."""
     __tablename__ = 'owners'
-
     id = Column(Integer, primary_key=True)
     name = Column(String(20), unique=True, nullable=False, index=True)
 
-    # Links this owner to their entries in the MediaOwnership association table.
-    ownership_records = relationship("MediaOwnership", back_populates="owner")
+    # Relationship to the ownership association table
+    locations = relationship("MediaOwnership", back_populates="owner")
+
+
+class Location(Base):
+    """
+    NEW: Central table for file paths. Each path is unique.
+    A location represents a single instance of a media file on disk.
+    """
+    __tablename__ = 'locations'
+    id = Column(Integer, primary_key=True, index=True)
+    path = Column(String, nullable=False, unique=True, index=True)
+    filename = Column(String, nullable=False)
+
+    # A location is an instance of ONE media file's content
+    media_file_id = Column(Integer, ForeignKey('media_files.id'), nullable=False)
+    media_file = relationship("MediaFile", back_populates="locations")
+
+    # A location can be owned by many people (though typically one)
+    owners = relationship("MediaOwnership", back_populates="location")
+
+    # A location can have multiple metadata entries from different sources
+    metadata_entries = relationship("Metadata", back_populates="location", cascade="all, delete-orphan")
+
+
+class MediaFile(Base):
+    """
+    Represents a unique piece of media content, identified by its hash.
+    """
+    __tablename__ = 'media_files'
+    id = Column(Integer, primary_key=True, index=True)
+    file_hash = Column(String, nullable=False, index=True, unique=True)
+    mime_type = Column(String, nullable=False)
+    file_size = Column(Integer, nullable=False)
+
+    # A single media file (hash) can exist at multiple locations
+    locations = relationship("Location", back_populates="media_file", cascade="all, delete-orphan")
+
+    # A single media file can have multiple sources of metadata
+    metadata_sources = relationship("Metadata", back_populates="media_file", cascade="all, delete-orphan")
 
 
 class MediaOwnership(Base):
     """
-    This is an 'association object' that connects MediaFile and Owner.
-    It creates the many-to-many relationship and stores additional data
-    about that relationship—specifically, the 'location' of that file instance.
+    Association object linking an Owner to a Location.
+    This signifies that a specific person owns the file at a specific path.
     """
     __tablename__ = 'media_ownership'
     __table_args__ = (
-        # A specific file can only be owned by a specific person at a specific location once.
-        UniqueConstraint('media_file_id', 'owner_id', 'location', name='uq_owner_file_location'),
+        UniqueConstraint('owner_id', 'location_id', name='uq_owner_location'),
     )
-
     id = Column(Integer, primary_key=True, index=True)
-    media_file_id = Column(Integer, ForeignKey('media_files.id'), nullable=False)
     owner_id = Column(Integer, ForeignKey('owners.id'), nullable=False)
-    location = Column(String, nullable=False, index=True)  # File path for this instance
-    filename = Column(String, nullable=False)
+    location_id = Column(Integer, ForeignKey('locations.id'), nullable=False)
 
-    # Relationships back to the parent tables
-    media_file = relationship("MediaFile", back_populates="owners")
-    owner = relationship("Owner", back_populates="ownership_records")
+    owner = relationship("Owner", back_populates="locations")
+    location = relationship("Location", back_populates="owners")
 
-class MediaFile(Base):
-    __tablename__ = 'media_files'
-    # __table_args__ is removed as the file path constraint is no longer here.
-
-    id = Column(Integer, primary_key=True, index=True)
-    # MODIFIED: file_hash is now unique. This table now stores a single record
-    # for each unique piece of media content.
-    file_hash = Column(String, nullable=False, index=True, unique=True)
-    # REMOVED: 'relative_path' and 'base_path' are now in the MediaOwnership table.
-    mime_type = Column(String, nullable=False)
-    file_size = Column(Integer, nullable=False)
-
-    # ADDED: Relationship to the MediaOwnership association table.
-    owners = relationship("MediaOwnership", back_populates="media_file", cascade="all, delete-orphan")
-
-    # Unchanged Relationships
-    processed_metadata = relationship("Metadata", back_populates="media_file", uselist=False,
-                                      cascade="all, delete-orphan")
-    google_metadata = relationship("GooglePhotosMetadata", uselist=False, cascade="all, delete-orphan")
-    raw_exif = relationship("RawExif", cascade="all, delete-orphan")
-    raw_google_json = relationship("RawGoogleJson", cascade="all, delete-orphan")
 
 class Metadata(Base):
     __tablename__ = 'metadata'
-
+    __table_args__ = (
+        # A media file can only have one metadata entry per source (e.g., one 'exif').
+        UniqueConstraint('media_file_id', 'source', name='uq_media_file_source'),
+    )
     id = Column(Integer, primary_key=True)
-    # Changed from file_hash to the integer primary key of MediaFile.
-    # Added unique=True to enforce the one-to-one relationship.
-    media_file_id = Column(Integer, ForeignKey('media_files.id'), unique=True, nullable=False)
+    media_file_id = Column(Integer, ForeignKey('media_files.id'), nullable=False, index=True)
+    location_id = Column(Integer, ForeignKey('locations.id'), nullable=False, index=True)
 
-    title = Column(String)
-    description = Column(String)
+    source = Column(String, nullable=False)  # e.g., 'exif', 'google_json'
+
+    # Key parsed fields for quick access and merging
     date_taken = Column(AwareDateTime)
-    camera_make = Column(String)
-    camera_model = Column(String)
-    lens_model = Column(String)
-    focal_length = Column(Integer)
-    aperture = Column(REAL)
-    shutter_speed = Column(REAL)
-    iso = Column(Integer)
     gps_latitude = Column(REAL)
     gps_longitude = Column(REAL)
-    city = Column(String)
-    country = Column(String)
-    rating = Column(Integer)
-    is_favorite = Column(Boolean, default=False)
-    width = Column(Integer)
-    height = Column(Integer)
-    duration_seconds = Column(REAL)
 
-    media_file = relationship("MediaFile", back_populates="processed_metadata")
+    # The complete raw data from the source
+    raw_data = Column(JSON, nullable=False)
 
-
-class GooglePhotosMetadata(Base):
-    __tablename__ = 'google_photos_metadata'
-
-    # The media file's ID is now the primary key, linking directly to media_files.id.
-    media_file_id = Column(Integer, ForeignKey('media_files.id'), primary_key=True)
-
-    title = Column(String)
-    description = Column(String)
-    creation_timestamp = Column(DateTime)
-    modified_timestamp = Column(DateTime)
-    google_url = Column(String)
-    gps_latitude = Column(REAL)
-    gps_longitude = Column(REAL)
-    is_favorited = Column(Boolean, default=False)
-
-    media_file = relationship("MediaFile", back_populates="google_metadata")
-
-
-class RawExif(Base):
-    __tablename__ = 'raw_exif'
-
-    id = Column(Integer, primary_key=True)
-    media_file_id = Column(Integer, ForeignKey('media_files.id'), nullable=False, index=True)
-    data = Column(JSON, nullable=False)
-
-    media_file = relationship("MediaFile", back_populates="raw_exif")
-
-
-class RawGoogleJson(Base):
-    __tablename__ = 'raw_google_json'
-
-    id = Column(Integer, primary_key=True)
-    media_file_id = Column(Integer, ForeignKey('media_files.id'), nullable=False, index=True)
-    data = Column(JSON, nullable=False)
-
-    media_file = relationship("MediaFile", back_populates="raw_google_json")
+    media_file = relationship("MediaFile", back_populates="metadata_sources")
+    location = relationship("Location", back_populates="metadata_entries")
