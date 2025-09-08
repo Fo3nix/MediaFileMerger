@@ -2,13 +2,15 @@ import os
 import argparse
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Tuple, Any
 
 from tqdm import tqdm
 from sqlalchemy.orm import Session, joinedload, selectinload
 from photoprocessor.database import engine, SessionLocal
 from photoprocessor import models
+from photoprocessor.merge_rules import rules
+
 
 
 # --- Configuration ---
@@ -40,57 +42,40 @@ def get_locations_for_owner(db: Session, owner: models.Owner) -> List[models.Loc
     return [record.location for record in ownership_records]
 
 
-def merge_metadata_for_export(metadata_sources: List[models.Metadata]) -> Tuple[Dict, Dict]:
+def merge_metadata_for_export(main_source: models.Metadata, metadata_sources: List[models.Metadata]) -> Tuple[Dict, Dict]:
     """
     Merges multiple metadata sources into a single dictionary for export.
-    Priority: 'exif' > 'google_json'.
     """
-    if not metadata_sources:
-        return {}, {}
+    def source_as_dict(source: models.Metadata) -> Dict[str, Any]:
+        if not source:
+            return {}
+        return {
+            "date_taken": source.date_taken,
+            "gps_latitude": source.gps_latitude,
+            "gps_longitude": source.gps_longitude,
+        }
 
-    merged = {}
+    main_dict = source_as_dict(main_source)
+
+    if not metadata_sources:
+        return main_dict, {}
+
+    merged = main_dict
     conflicts = {}
 
-    # Sort sources by priority
-    sources = sorted(metadata_sources, key=lambda m: 1 if m.source == 'exif' else 2)
-
-    # Define which raw keys map to our simple fields
-    key_map = {
-        'date_taken': 'date_taken',
-        'gps_latitude': 'gps_latitude',
-        'gps_longitude': 'gps_longitude',
-        # Add more mappings from raw_data if needed (e.g., description, title)
-        'description': 'description',
-        'title': 'title',
-    }
-
-    for key, field_name in key_map.items():
-        for source in sources:
-            value = source.raw_data.get(field_name) if field_name in source.raw_data else getattr(source, field_name,
-                                                                                                  None)
-
-            if value is None or value == '' or value == 0:
-                continue
-
-            if key not in merged:
-                merged[key] = value
-            elif merged[key] != value:
-                if key not in conflicts:
-                    conflicts[key] = []
-                conflicts[key].append(value)
-
-    if conflicts:
-        # For simplicity, we just report conflicts. A more complex strategy could resolve them.
-        pass
-
-    # You can add logic here to pull more fields directly from the preferred raw_data (e.g., camera model from exif)
-    exif_source = next((s for s in sources if s.source == 'exif'), None)
-    if exif_source and exif_source.raw_data:
-        merged.update({
-            "camera_make": exif_source.raw_data.get("Make"),
-            "camera_model": exif_source.raw_data.get("Model"),
-            # ... add other exif-specific fields you want to preserve
-        })
+    for source in metadata_sources:
+        src_dict = source_as_dict(source)
+        for key, value in src_dict.items():
+            if value is not None:
+                if key not in merged or merged[key] is None:
+                    merged[key] = value
+                elif rules.compare(key, merged[key], value):
+                    # Values are considered equivalent; no action needed.
+                    continue
+                elif merged[key] != value:
+                    if key not in conflicts:
+                        conflicts[key] = {merged[key]}
+                    conflicts[key].add(value)
 
     return merged, conflicts
 
@@ -104,7 +89,6 @@ def write_metadata_with_exiftool(filepath: str, metadata: Dict):
     tag_map = {
         "title": "-Title",
         "description": "-Description",
-        "date_taken": "-AllDates",  # Sets EXIF:DateTimeOriginal, CreateDate, and ModifyDate
         "gps_latitude": "-GPSLatitude",
         "gps_longitude": "-GPSLongitude",
         "camera_make": "-Make",
@@ -114,6 +98,32 @@ def write_metadata_with_exiftool(filepath: str, metadata: Dict):
         "focal_length": "-FocalLength",
         "iso": "-ISO",
     }
+
+    date_taken = metadata.get("date_taken")
+    if date_taken:
+        # 1. Format for EXIF (Local Time + Offset)
+        local_time_str = date_taken.strftime('%Y:%m:%d %H:%M:%S')
+        offset_str = date_taken.strftime('%z')
+        offset_str_formatted = f"{offset_str[:3]}:{offset_str[3:]}"  # Format as +/-HH:MM
+
+        # 2. Format for QuickTime (UTC)
+        utc_date = date_taken.astimezone(timezone.utc)
+        utc_time_str = utc_date.strftime('%Y:%m:%d %H:%M:%S')
+
+        # Add all relevant date tags. ExifTool will apply them correctly.
+        args.extend([
+            f"-EXIF:DateTimeOriginal={local_time_str}",
+            f"-EXIF:CreateDate={local_time_str}",  # Also set CreateDate for consistency
+            f"-EXIF:OffsetTimeOriginal={offset_str_formatted}",
+            f"-QuickTime:CreateDate={utc_time_str}",
+            f"-QuickTime:ModifyDate={utc_time_str}",
+            f"-Keys:CreationDate={utc_time_str}",  # For HEIC files
+            f"-FileCreateDate={local_time_str}",  # Set file system dates
+            f"-FileModifyDate={local_time_str}",
+        ])
+
+    # Remove 'date_taken' from metadata to avoid processing it in the loop
+    metadata.pop("date_taken", None)
 
     for key, value in metadata.items():
 
@@ -183,7 +193,8 @@ def export_main(owner_name: str, export_dir: str):
                         continue
 
                     try:
-                        merged_meta, conflicts = merge_metadata_for_export(location.media_file.metadata_sources)
+                        main_metadata_source = location.media_file.metadata_sources[0] if location.media_file.metadata_sources else None
+                        merged_meta, conflicts = merge_metadata_for_export(main_metadata_source,location.media_file.metadata_sources[1:])
 
                         if conflicts:
                             conflict_count += 1
