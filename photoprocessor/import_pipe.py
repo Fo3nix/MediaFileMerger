@@ -107,12 +107,15 @@ def process_batch(db: Session, processor: PhotoProcessor, paths: List[str], owne
                     ownership = models.MediaOwnership(owner=owner, location=location_obj)
                     db.add(ownership)
 
-                # --- NEW METADATA HANDLING LOGIC ---
                 def upsert_metadata(source_name: str, source_data: Dict):
+                    """
+                    Creates or updates metadata for a specific location.
+                    This allows duplicate files to have different sidecar metadata.
+                    """
                     if not source_data:
                         return
 
-                    # Query for existing metadata for THIS specific location and source
+                    # Query for existing metadata for THIS specific location and source.
                     metadata_entry = db.query(models.Metadata).filter_by(
                         location_id=location_obj.id,
                         source=source_name
@@ -121,13 +124,13 @@ def process_batch(db: Session, processor: PhotoProcessor, paths: List[str], owne
                     parsed_data = source_data["parsed"]
 
                     if metadata_entry:
-                        # UPDATE existing entry
+                        # UPDATE the existing entry for this location.
                         metadata_entry.date_taken = parsed_data.get("date_taken")
                         metadata_entry.gps_latitude = parsed_data.get("gps_latitude")
                         metadata_entry.gps_longitude = parsed_data.get("gps_longitude")
                         metadata_entry.raw_data = source_data["raw"]
                     else:
-                        # CREATE new entry
+                        # CREATE a new entry for this location.
                         metadata_entry = models.Metadata(
                             media_file=media_file_obj,
                             location=location_obj,

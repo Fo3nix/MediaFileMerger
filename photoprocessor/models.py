@@ -104,10 +104,10 @@ class MediaOwnership(Base):
 
 class Metadata(Base):
     __tablename__ = 'metadata'
-    __table_args__ = (
-        # A media file can only have one metadata entry per source (e.g., one 'exif').
-        UniqueConstraint('media_file_id', 'source', name='uq_media_file_source'),
-    )
+    # __table_args__ = (
+    #     # A media file can only have one metadata entry per source (e.g., one 'exif').
+    #     UniqueConstraint('media_file_id', 'source', name='uq_media_file_source'),
+    # )
     id = Column(Integer, primary_key=True)
     media_file_id = Column(Integer, ForeignKey('media_files.id'), nullable=False, index=True)
     location_id = Column(Integer, ForeignKey('locations.id'), nullable=False, index=True)
