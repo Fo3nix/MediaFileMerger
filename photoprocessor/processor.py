@@ -7,6 +7,7 @@ import magic
 from timezonefinder import TimezoneFinder
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from queue import Queue, Empty
 from functools import lru_cache
 
 import imagehash
@@ -316,53 +317,97 @@ class PhotoProcessor:
 
     def process_batch(self, filepaths: list[str]) -> tuple[dict, list]:
         """
-        Processes a BATCH of files serially, separating successes and failures.
-        Designed to be called by a worker process.
+        Processes a batch of files using an internal producer-consumer pipeline
+        to overlap I/O (file reading) and CPU (hashing) work.
         """
         if not filepaths:
             return {}, []
 
+        # --- Step 1: Batched I/O for metadata (still the most efficient way) ---
         all_raw_exif = self._get_exiftool_batch_dict(filepaths)
         exif_map = {os.path.abspath(d.get('SourceFile')): d for d in all_raw_exif}
 
         successes = {}
         failures = []
 
-        for path in filepaths:
-            abs_path = os.path.abspath(path)
-            if not os.path.exists(abs_path):
-                failures.append({"path": path, "error": "File not found during processing"})
-                continue
+        # --- Step 2: Set up the producer-consumer pipeline ---
+        # A small queue to buffer images read from disk, preventing high memory usage.
+        image_queue = Queue(maxsize=os.cpu_count() or 4)
 
-            try:
-                raw_exif_dict = exif_map.get(abs_path)
-                google_json_dict = _standalone_get_google_json_dict(path)
+        # We use a ThreadPoolExecutor with a few workers for the I/O-bound tasks.
+        with ThreadPoolExecutor(max_workers=4) as io_executor:
 
-                mime_type = raw_exif_dict.get("File:MIMEType",
-                                              "unknown/unknown") if raw_exif_dict else "unknown/unknown"
-                file_hash = None
+            # --- The Producer's job: Read files and get metadata ---
+            def producer(path):
+                try:
+                    abs_path = os.path.abspath(path)
+                    raw_exif_dict = exif_map.get(abs_path)
+                    google_json_dict = _standalone_get_google_json_dict(path)
 
-                if mime_type.startswith("image/"):
-                    file_hash = _perceptual_image_hash(path)
-                elif mime_type.startswith("video/"):
-                    file_hash = _perceptual_video_hash(path)
-                else:
-                    file_hash = _hash_file_partially(path)
+                    mime_type = raw_exif_dict.get("File:MIMEType",
+                                                  "unknown/unknown") if raw_exif_dict else "unknown/unknown"
 
-                if not file_hash:
-                    raise ValueError("Hashing failed, returned None.")
+                    # Pre-load the image data from disk (I/O-bound work)
+                    image_obj = None
+                    if mime_type.startswith("image/"):
+                        with Image.open(path) as img:
+                            img.thumbnail((256, 256))
+                            image_obj = img.copy()  # copy() is important to release file handle
 
-                successes[path] = {
-                    "media_file": {
-                        "file_hash": file_hash, "mime_type": mime_type,
-                        "file_size": raw_exif_dict.get("File:FileSize", 0) if raw_exif_dict else os.path.getsize(path),
-                    },
-                    "exif_metadata": {"parsed": self._parse_key_exif_fields(raw_exif_dict),
-                                      "raw": raw_exif_dict} if raw_exif_dict else None,
-                    "google_metadata": {"parsed": self._parse_key_google_fields(google_json_dict),
-                                        "raw": google_json_dict} if google_json_dict else None
-                }
-            except Exception as e:
-                failures.append({"path": path, "error": str(e)})
+                    # Put all necessary data into the queue for the consumer
+                    image_queue.put({
+                        "path": path,
+                        "image_obj": image_obj,
+                        "raw_exif_dict": raw_exif_dict,
+                        "google_json_dict": google_json_dict,
+                        "mime_type": mime_type
+                    })
+                except Exception as e:
+                    image_queue.put({"path": path, "error": e})
+
+            # Submit all I/O-bound producer jobs to the thread pool
+            for path in filepaths:
+                io_executor.submit(producer, path)
+
+            # --- The Consumer's job: Hash the pre-loaded data (CPU-bound) ---
+            for _ in range(len(filepaths)):
+                data = image_queue.get()
+                path = data["path"]
+
+                try:
+                    if "error" in data:
+                        raise data["error"]
+
+                    mime_type = data["mime_type"]
+                    file_hash = None
+
+                    if mime_type.startswith("image/"):
+                        # Hashing is CPU-bound and works on the pre-loaded image_obj
+                        file_hash = str(imagehash.phash(data["image_obj"]))
+                    elif mime_type.startswith("video/"):
+                        # Video hashing is a separate process, can be done directly
+                        file_hash = _perceptual_video_hash(path)
+                    else:
+                        file_hash = _hash_file_partially(path)
+
+                    if not file_hash:
+                        raise ValueError("Hashing failed")
+
+                    raw_exif_dict = data["raw_exif_dict"]
+                    google_json_dict = data["google_json_dict"]
+
+                    successes[path] = {
+                        "media_file": {
+                            "file_hash": file_hash, "mime_type": mime_type,
+                            "file_size": raw_exif_dict.get("File:FileSize", 0) if raw_exif_dict else os.path.getsize(
+                                path),
+                        },
+                        "exif_metadata": {"parsed": self._parse_key_exif_fields(raw_exif_dict),
+                                          "raw": raw_exif_dict} if raw_exif_dict else None,
+                        "google_metadata": {"parsed": self._parse_key_google_fields(google_json_dict),
+                                            "raw": google_json_dict} if google_json_dict else None
+                    }
+                except Exception as e:
+                    failures.append({"path": path, "error": str(e)})
 
         return successes, failures
