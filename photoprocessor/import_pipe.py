@@ -10,7 +10,7 @@ from photoprocessor import models
 
 # --- Configuration ---
 CONFIG = {
-    "BATCH_SIZE": 100,
+    "BATCH_SIZE": 500,
     "MEDIA_EXTENSIONS": (
         '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.heic', '.webp',
         '.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv'
