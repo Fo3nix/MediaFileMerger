@@ -99,10 +99,14 @@ def _generate_exiftool_args_for_file(metadata: Dict[str, Any]) -> List[str]:
         utc_date = date_taken.astimezone(timezone.utc)
         utc_time_str = utc_date.strftime('%Y:%m:%d %H:%M:%S')
         args.extend([
-            f"-EXIF:DateTimeOriginal={local_time_str}", f"-EXIF:CreateDate={local_time_str}",
-            f"-EXIF:OffsetTimeOriginal={offset_str_formatted}", f"-QuickTime:CreateDate={utc_time_str}",
-            f"-QuickTime:ModifyDate={utc_time_str}", f"-Keys:CreationDate={utc_time_str}",
+            f"-EXIF:DateTimeOriginal={local_time_str}",
+            f"-EXIF:CreateDate={local_time_str}",
+            f"-EXIF:OffsetTimeOriginal={offset_str_formatted}",
+            f"-QuickTime:CreateDate={utc_time_str}",
+            f"-QuickTime:ModifyDate={utc_time_str}",
+            f"-Keys:CreationDate={utc_time_str}",
             f"-FileModifyDate={local_time_str}",
+            f"-FileCreateDate={local_time_str}",
         ])
     for key, value in metadata.items():
         if key in tag_map and value is not None:
