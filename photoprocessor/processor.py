@@ -314,60 +314,55 @@ class PhotoProcessor:
             "gps_longitude": longitude,
         }
 
-    def process_batch(self, filepaths: list[str]) -> dict[str, dict]:
+    def process_batch(self, filepaths: list[str]) -> tuple[dict, list]:
         """
-        Processes a BATCH of files using a pipeline model to overlap I/O and CPU work.
+        Processes a BATCH of files serially, separating successes and failures.
+        Designed to be called by a worker process.
         """
-        # Step 1: Get all exif data in one go (fast I/O for metadata).
+        if not filepaths:
+            return {}, []
+
         all_raw_exif = self._get_exiftool_batch_dict(filepaths)
         exif_map = {os.path.abspath(d.get('SourceFile')): d for d in all_raw_exif}
 
-        results = {}
-        hash_futures = {}
+        successes = {}
+        failures = []
 
-        with ThreadPoolExecutor() as executor:
-            # Step 2: Dispatch all the heavy hashing jobs to the background threads.
-            # The main thread does NOT wait here.
-            for path in filepaths:
-                if os.path.exists(path):
-                    mime_type = exif_map.get(path, {}).get("File:MIMEType", "")
-                    if mime_type.startswith("image/"):
-                        future = executor.submit(_perceptual_image_hash, path)
-                    elif mime_type.startswith("video/"):
-                        future = executor.submit(_perceptual_video_hash, path)
-                    else:
-                        print(f"Info: Unknown MIME type '{mime_type}' for file '{path}'. Using partial file hash.")
-                        future = executor.submit(_hash_file_partially, path)
-                    hash_futures[path] = future
+        for path in filepaths:
+            abs_path = os.path.abspath(path)
+            if not os.path.exists(abs_path):
+                failures.append({"path": path, "error": "File not found during processing"})
+                continue
 
-            # Step 3: While hashing runs in the background, do the other, faster work.
-            for path in filepaths:
-                if not os.path.exists(path):
-                    continue
-
-                # Get data that's already available or fast to access
-                raw_exif_dict = exif_map.get(path)
+            try:
+                raw_exif_dict = exif_map.get(abs_path)
                 google_json_dict = _standalone_get_google_json_dict(path)
 
-                # Step 4: Now, get the hash result. If it's not ready, this line will
-                # wait. But much of the waiting has already happened in the background.
-                file_hash = hash_futures[path].result()
+                mime_type = raw_exif_dict.get("File:MIMEType",
+                                              "unknown/unknown") if raw_exif_dict else "unknown/unknown"
+                file_hash = None
 
-                # Assemble the final dictionary entry
-                results[path] = {
+                if mime_type.startswith("image/"):
+                    file_hash = _perceptual_image_hash(path)
+                elif mime_type.startswith("video/"):
+                    file_hash = _perceptual_video_hash(path)
+                else:
+                    file_hash = _hash_file_partially(path)
+
+                if not file_hash:
+                    raise ValueError("Hashing failed, returned None.")
+
+                successes[path] = {
                     "media_file": {
-                        "file_hash": file_hash,
-                        "mime_type": raw_exif_dict.get("File:MIMEType",
-                                                       "unknown/unknown") if raw_exif_dict else "unknown/unknown",
+                        "file_hash": file_hash, "mime_type": mime_type,
                         "file_size": raw_exif_dict.get("File:FileSize", 0) if raw_exif_dict else os.path.getsize(path),
                     },
-                    "exif_metadata": {
-                        "parsed": self._parse_key_exif_fields(raw_exif_dict),
-                        "raw": raw_exif_dict
-                    } if raw_exif_dict else None,
-                    "google_metadata": {
-                        "parsed": self._parse_key_google_fields(google_json_dict),
-                        "raw": google_json_dict
-                    } if google_json_dict else None
+                    "exif_metadata": {"parsed": self._parse_key_exif_fields(raw_exif_dict),
+                                      "raw": raw_exif_dict} if raw_exif_dict else None,
+                    "google_metadata": {"parsed": self._parse_key_google_fields(google_json_dict),
+                                        "raw": google_json_dict} if google_json_dict else None
                 }
-        return results
+            except Exception as e:
+                failures.append({"path": path, "error": str(e)})
+
+        return successes, failures

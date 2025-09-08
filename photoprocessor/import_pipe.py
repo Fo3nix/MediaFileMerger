@@ -1,16 +1,18 @@
 import os
 import argparse
-from typing import List, Dict, Tuple, Any
+import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import List, Dict
 
 from tqdm import tqdm
-from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy.orm import Session
 from photoprocessor.processor import PhotoProcessor
 from photoprocessor.database import engine, SessionLocal
 from photoprocessor import models
 
 # --- Configuration ---
 CONFIG = {
-    "BATCH_SIZE": 250,
+    "BATCH_SIZE": 100,
     "MEDIA_EXTENSIONS": (
         '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.heic', '.webp',
         '.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv'
@@ -20,36 +22,24 @@ CONFIG = {
 
 # --- End Configuration ---
 
-class LocationHashConflictError(Exception):
-    """Custom exception for when a path points to a file with a different hash than recorded."""
-    def __init__(self, message, location_path, existing_hash, new_hash):
-        super().__init__(message)
-        self.location_path = location_path
-        self.existing_hash = existing_hash
-        self.new_hash = new_hash
+# This worker function is executed by each process in the pool.
+def process_media_chunk(chunk: List[str]) -> tuple[dict, list]:
+    """Worker function to process a chunk of file paths."""
+    processor = PhotoProcessor()
+    return processor.process_batch(chunk)
 
-# ADD THIS ENTIRE CLASS
-class MergeConflictException(Exception):
-    """Custom exception to signal a rollback for a single file merge."""
-    def __init__(self, message, location, conflicts):
-        super().__init__(message)
-        self.location = location
-        self.conflicts = conflicts
 
 def get_or_create_owner(db: Session, name: str) -> models.Owner:
-    # This function remains unchanged
     owner = db.query(models.Owner).filter(models.Owner.name == name).first()
     if not owner:
-        print(f"Owner '{name}' not found, creating new entry.")
         owner = models.Owner(name=name)
         db.add(owner)
-        db.commit()
+        db.commit();
         db.refresh(owner)
     return owner
 
 
 def scan_media_files(directory: str) -> List[str]:
-    # This function remains unchanged
     print(f"Scanning for media files in {directory}...")
     paths = []
     for root, _, files in os.walk(directory):
@@ -59,42 +49,32 @@ def scan_media_files(directory: str) -> List[str]:
     return paths
 
 
-def process_batch(db: Session, processor: PhotoProcessor, paths: List[str], owner: models.Owner) -> Dict:
-    """Processes a batch of files with explicit get-or-create/update logic for metadata."""
+def save_batch_to_db(db: Session, owner: models.Owner, batch_data: Dict) -> (Dict, List):
+    """Saves processed data to the database and returns stats and failures."""
     stats = {"inserted": 0, "updated": 0, "conflicts": 0}
     failures = []
-
-    batch_data = processor.process_batch([os.path.abspath(p) for p in paths])
-
     if not batch_data:
         return stats, failures
 
-    abs_paths = list(batch_data.keys())
+    abs_paths = [os.path.abspath(p) for p in batch_data.keys()]
     existing_locations = {loc.path: loc for loc in
-                          db.query(models.Location).options(selectinload(models.Location.media_file)).filter(
-                              models.Location.path.in_(abs_paths))}
+                          db.query(models.Location).filter(models.Location.path.in_(abs_paths))}
     hashes_to_check = {item["media_file"]["file_hash"] for item in batch_data.values()}
     existing_media_files = {mf.file_hash: mf for mf in
                             db.query(models.MediaFile).filter(models.MediaFile.file_hash.in_(hashes_to_check))}
 
-    for abs_path, data in batch_data.items():
+    for path, data in batch_data.items():
+        abs_path = os.path.abspath(path)
         try:
             with db.begin_nested():
                 current_hash = data["media_file"]["file_hash"]
-                location_obj = existing_locations.get(abs_path)
-
-                if location_obj and location_obj.media_file.file_hash != current_hash:
-                    raise LocationHashConflictError(
-                        "File content has changed for a known location",
-                        abs_path, location_obj.media_file.file_hash, current_hash
-                    )
-
                 media_file_obj = existing_media_files.get(current_hash)
                 if not media_file_obj:
                     media_file_obj = models.MediaFile(**data["media_file"])
                     db.add(media_file_obj)
                     existing_media_files[current_hash] = media_file_obj
 
+                location_obj = existing_locations.get(abs_path)
                 if not location_obj:
                     location_obj = models.Location(path=abs_path, filename=os.path.basename(abs_path),
                                                    media_file=media_file_obj)
@@ -102,100 +82,103 @@ def process_batch(db: Session, processor: PhotoProcessor, paths: List[str], owne
                     stats["inserted"] += 1
                 else:
                     stats["updated"] += 1
+                    if location_obj.media_file.file_hash != current_hash:
+                        raise ValueError(
+                            f"Hash conflict: path points to a different file. Old: {location_obj.media_file.file_hash}, New: {current_hash}")
 
                 if owner not in [own.owner for own in location_obj.owners]:
-                    ownership = models.MediaOwnership(owner=owner, location=location_obj)
-                    db.add(ownership)
+                    db.add(models.MediaOwnership(owner=owner, location=location_obj))
 
+                # Your location-specific metadata upsert logic from before
                 def upsert_metadata(source_name: str, source_data: Dict):
-                    """
-                    Creates or updates metadata for a specific location.
-                    This allows duplicate files to have different sidecar metadata.
-                    """
-                    if not source_data:
-                        return
-
-                    # Query for existing metadata for THIS specific location and source.
-                    metadata_entry = db.query(models.Metadata).filter_by(
-                        location_id=location_obj.id,
-                        source=source_name
-                    ).first()
-
-                    parsed_data = source_data["parsed"]
-
+                    if not source_data: return
+                    metadata_entry = db.query(models.Metadata).filter_by(location_id=location_obj.id,
+                                                                         source=source_name).first()
+                    parsed = source_data["parsed"]
                     if metadata_entry:
-                        # UPDATE the existing entry for this location.
-                        metadata_entry.date_taken = parsed_data.get("date_taken")
-                        metadata_entry.gps_latitude = parsed_data.get("gps_latitude")
-                        metadata_entry.gps_longitude = parsed_data.get("gps_longitude")
-                        metadata_entry.raw_data = source_data["raw"]
+                        metadata_entry.date_taken, metadata_entry.gps_latitude, metadata_entry.gps_longitude, metadata_entry.raw_data = parsed.get(
+                            "date_taken"), parsed.get("gps_latitude"), parsed.get("gps_longitude"), source_data["raw"]
                     else:
-                        # CREATE a new entry for this location.
-                        metadata_entry = models.Metadata(
-                            media_file=media_file_obj,
-                            location=location_obj,
-                            source=source_name,
-                            date_taken=parsed_data.get("date_taken"),
-                            gps_latitude=parsed_data.get("gps_latitude"),
-                            gps_longitude=parsed_data.get("gps_longitude"),
-                            raw_data=source_data["raw"]
-                        )
-                        db.add(metadata_entry)
+                        db.add(models.Metadata(media_file=media_file_obj, location=location_obj, source=source_name,
+                                               date_taken=parsed.get("date_taken"),
+                                               gps_latitude=parsed.get("gps_latitude"),
+                                               gps_longitude=parsed.get("gps_longitude"), raw_data=source_data["raw"]))
 
                 upsert_metadata('exif', data.get("exif_metadata"))
                 upsert_metadata('google_json', data.get("google_metadata"))
 
-        except LocationHashConflictError as e:
-            db.rollback()
-            stats["conflicts"] += 1
-            failures.append({"path": e.location_path, "error": str(e),
-                             "details": f"Existing Hash: {e.existing_hash}, New Hash: {e.new_hash}"})
         except Exception as e:
             db.rollback()
-            print(f"Unexpected error for {abs_path}: {e}")
+            stats["conflicts"] += 1
+            failures.append({"path": path, "error": f"Database error: {e}"})
 
     return stats, failures
 
+
 def main(owner_name: str, takeout_dir: str):
-    print("Initializing database...")
+    print("Initializing...")
     models.Base.metadata.create_all(bind=engine)
-    processor = PhotoProcessor()
+
+    # --- Set up failure logger ---
+    failure_log_path = 'import_failures.log'
+    logging.basicConfig(level=logging.ERROR, filename=failure_log_path, filemode='w',
+                        format='%(asctime)s - %(message)s')
 
     all_paths = scan_media_files(takeout_dir)
     total_files = len(all_paths)
-    if total_files == 0:
-        print("No media files found. Exiting.")
+    if not total_files:
+        print("No media files found.");
         return
 
     print(f"Found {total_files} files to process.")
+    chunks = [all_paths[i:i + CONFIG["BATCH_SIZE"]] for i in range(0, total_files, CONFIG["BATCH_SIZE"])]
 
-    total_stats = {"inserted": 0, "updated": 0, "conflicts": 0}
-    all_failures = []
+    total_stats = {"inserted": 0, "updated": 0, "conflicts": 0, "failures": 0}
 
-    try:
-        with SessionLocal() as db:
+    with tqdm(total=total_files, desc="Importing Media", unit="file") as pbar:
+        with ProcessPoolExecutor() as executor, SessionLocal() as db:
             owner = get_or_create_owner(db, owner_name)
-            with tqdm(total=total_files, desc="Importing Media", unit="file") as pbar:
-                for batch_paths in (all_paths[i:i + CONFIG["BATCH_SIZE"]] for i in
-                                    range(0, total_files, CONFIG["BATCH_SIZE"])):
-                    stats, failures = process_batch(db, processor, batch_paths, owner)
-                    db.commit()
 
-                    for key in total_stats:
-                        total_stats[key] += stats[key]
-                    all_failures.extend(failures)
+            # Submit all chunks to the executor
+            futures = [executor.submit(process_media_chunk, chunk) for chunk in chunks]
 
-                    pbar.update(len(batch_paths))
+            for future in as_completed(futures):
+                try:
+                    success_data, process_failures = future.result()
+
+                    # Log failures from the worker process
+                    for failure in process_failures:
+                        logging.error(f"File: {failure['path']}\n  Error: {failure['error']}\n")
+                        total_stats["failures"] += 1
+
+                    # Save successes to the database
+                    if success_data:
+                        db_stats, db_failures = save_batch_to_db(db, owner, success_data)
+                        db.commit()
+
+                        # Log failures from the database operation
+                        for failure in db_failures:
+                            logging.error(f"File: {failure['path']}\n  Error: {failure['error']}\n")
+
+                        # Aggregate stats
+                        for key in db_stats: total_stats[key] += db_stats[key]
+                        total_stats["failures"] += len(db_failures)
+
+                    # Update progress bar by the number of files in the processed chunk
+                    pbar.update(len(success_data) + len(process_failures))
                     pbar.set_postfix(inserted=total_stats['inserted'], updated=total_stats['updated'],
-                                     failed=total_stats['conflicts'])
-    finally:
-        print("\nImport complete!")
-        print(f"✅ Inserted {total_stats['inserted']} new file locations.")
-        print(f"🔄 Scanned and updated metadata for {total_stats['updated']} existing file locations.")
-        if total_stats['conflicts'] > 0:
-            print(f"❌ Encountered {total_stats['conflicts']} hash conflicts. These files were skipped:")
-            for failure in all_failures:
-                print(f"  - File: {failure['path']}\n    Reason: {failure['details']}")
+                                     failed=total_stats['failures'])
+
+                except Exception as e:
+                    # Catch unexpected errors from the worker process itself
+                    logging.error(f"A worker process failed catastrophically: {e}")
+
+    print("\n--- Import Complete ---")
+    print(f"✅ Inserted {total_stats['inserted']} new file locations.")
+    print(f"🔄 Scanned/updated {total_stats['updated']} existing file locations.")
+    if total_stats['failures'] > 0:
+        print(f"❌ Encountered {total_stats['failures']} failures. See details in {failure_log_path}")
+    print("-----------------------")
 
 
 if __name__ == "__main__":
