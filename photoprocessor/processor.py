@@ -4,10 +4,47 @@ import json
 import os
 from datetime import datetime, timezone
 import magic
+from timezonefinder import TimezoneFinder
+from zoneinfo import ZoneInfo
 
 
 class PhotoProcessor:
     """Processes a single photo file to extract and structure data for the database."""
+
+    def __init__(self):
+        """Initializes the PhotoProcessor and its tools."""
+        self.tf = TimezoneFinder()
+
+    def _get_aware_datetime(self, dt_obj: datetime, lat: float, lon: float) -> datetime | None:
+        """
+        Takes a datetime object and ensures it is aware and in the correct
+        local timezone based on coordinates.
+
+        - If the object is naive, it is localized to the target timezone.
+        - If the object is already aware (e.g., in UTC), it is converted to the target timezone.
+        """
+        # If we don't have a datetime or coordinates, we can't proceed.
+        if not dt_obj or lat is None or lon is None:
+            if dt_obj.tzinfo is None:
+                return None
+
+            return dt_obj
+
+        # Find the target timezone name from the coordinates
+        tz_name = self.tf.timezone_at(lng=lon, lat=lat)
+        if not tz_name:
+            if dt_obj.tzinfo is None:
+                return None
+            return dt_obj  # Return original if no timezone is found
+
+        target_tz = ZoneInfo(tz_name)
+
+        if dt_obj.tzinfo is None:
+            # The datetime is NAIVE. Stamp it with the local timezone.
+            return dt_obj.replace(tzinfo=target_tz)
+        else:
+            # The datetime is AWARE. Convert it to the local timezone.
+            return dt_obj.astimezone(target_tz)
 
     def _hash_file_content(self, filepath):
         """Computes the SHA256 hash of a file's content."""
@@ -82,23 +119,22 @@ class PhotoProcessor:
 
         return merged_data if merged_data else None
 
-    def _to_datetime(self, date_str):
-        print(f"Converting date string: {date_str}")
-        """Safely converts a timezone-aware string to a datetime object."""
+    def _to_datetime(self, date_str: str) -> datetime | None:
+        """
+        Safely converts a string to a datetime object.
+        It returns a naive object, which will be made aware later if possible.
+        """
         if not date_str or not isinstance(date_str, str):
             return None
-
-        # --- CORRECTION ---
-        # The primary method should be datetime.fromisoformat(), which is
-        # designed to parse the "YYYY-MM-DD HH:MM:SS+HH:MM" string.
         try:
-            # Replace spaces with 'T' for strict ISO 8601 compatibility if needed,
-            # though fromisoformat is often flexible. A simple replace is robust.
             iso_str = date_str.replace(" ", "T")
-            iso_str = iso_str.replace(':', '-', 2)
+            if iso_str.count(':') > 2:
+                iso_str = iso_str.replace(':', '-', 2)
+            # This will return an AWARE object if offset is in the string,
+            # or a NAIVE object if it's not.
             return datetime.fromisoformat(iso_str)
         except (ValueError, TypeError):
-            print(f"Warning: Could not parse date string: {date_str}")
+            print(f"Warning: Could not parse date string: '{date_str}'")
             return None
 
     def _get_optional(self, data_dict, keys):
@@ -120,25 +156,45 @@ class PhotoProcessor:
         """Extracts just the key fields needed for the unified Metadata table."""
         if not raw_exif:
             return None
-        return {
-            "date_taken": self._to_datetime(self._get_optional(raw_exif, [
+
+        date_taken = self._to_datetime(self._get_optional(raw_exif, [
                 ("EXIF:DateTimeOriginal", "EXIF:OffsetTimeOriginal"),
-                "XMP:DateTimeOriginal", "QuickTime:CreateDate", "EXIF:CreateDate", "File:FileModifyDate"
-            ])),
-            "gps_latitude": self._get_optional(raw_exif, ["EXIF:GPSLatitude", "Composite:GPSLatitude"]),
-            "gps_longitude": self._get_optional(raw_exif, ["EXIF:GPSLongitude", "Composite:GPSLongitude"]),
+                "EXIF:DateTimeOriginal", "XMP:DateTimeOriginal", "QuickTime:CreateDate", "EXIF:CreateDate", "File:FileModifyDate"
+            ]))
+        gps_latitude = self._get_optional(raw_exif, ["EXIF:GPSLatitude", "Composite:GPSLatitude"])
+        gps_longitude = self._get_optional(raw_exif, ["EXIF:GPSLongitude", "Composite:GPSLongitude"])
+
+        date_taken = self._get_aware_datetime(date_taken, gps_latitude, gps_longitude)
+
+        return {
+            "date_taken": date_taken,
+            "gps_latitude": gps_latitude,
+            "gps_longitude": gps_longitude,
         }
 
     def _parse_key_google_fields(self, google_json):
-        """Extracts just the key fields from Google JSON."""
+        """
+        Extracts key fields from Google JSON and converts the UTC timestamp
+        to the photo's local time.
+        """
         if not google_json:
             return None
+
+        # First, extract the raw values
         creation_time = google_json.get("photoTakenTime", {}).get("timestamp")
-        date_obj = datetime.fromtimestamp(int(creation_time), tz=timezone.utc) if creation_time else None
+        latitude = google_json.get("geoData", {}).get("latitude")
+        longitude = google_json.get("geoData", {}).get("longitude")
+
+        # Create a timezone-aware datetime object in UTC
+        utc_date = datetime.fromtimestamp(int(creation_time), tz=timezone.utc) if creation_time else None
+
+        # Now, use the helper to convert the UTC date to the photo's local timezone
+        local_date = self._get_aware_datetime(utc_date, latitude, longitude)
+
         return {
-            "date_taken": date_obj,
-            "gps_latitude": google_json.get("geoData", {}).get("latitude"),
-            "gps_longitude": google_json.get("geoData", {}).get("longitude"),
+            "date_taken": local_date,
+            "gps_latitude": latitude,
+            "gps_longitude": longitude,
         }
 
     def process_batch(self, filepaths: list[str]) -> dict[str, dict]:
