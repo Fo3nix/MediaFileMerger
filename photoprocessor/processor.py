@@ -6,7 +6,97 @@ from datetime import datetime, timezone
 import magic
 from timezonefinder import TimezoneFinder
 from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 
+@lru_cache(maxsize=256)
+def get_directory_contents(directory_path: str) -> set:
+    """
+    Lists the contents of a directory and returns them as a set for fast lookups.
+    The @lru_cache decorator automatically caches the results, so os.listdir()
+    is only called once for each unique directory.
+    """
+    try:
+        return set(os.listdir(directory_path))
+    except (FileNotFoundError, NotADirectoryError):
+        return set()
+
+def _standalone_hash_file_content(filepath: str) -> str:
+    """Computes the SHA256 hash of a file's content."""
+    sha256_hash = hashlib.sha256()
+    try:
+        with open(filepath, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except FileNotFoundError:
+        return "" # Return empty string if file disappears during processing
+
+def _hash_file_partially(filepath: str, chunk_size=1024 * 1024) -> str:
+    """
+    Generates a hash from the first and last chunks of a file.
+    This is dramatically faster for large files as it avoids reading the entire file.
+    """
+    sha256_hash = hashlib.sha256()
+    try:
+        with open(filepath, "rb") as f:
+            # Read the first chunk
+            first_chunk = f.read(chunk_size)
+            sha256_hash.update(first_chunk)
+
+            # If the file is large enough, seek to the end and read the last chunk
+            file_size = os.path.getsize(filepath)
+            if file_size > chunk_size:
+                f.seek(-chunk_size, os.SEEK_END)
+                last_chunk = f.read(chunk_size)
+                sha256_hash.update(last_chunk)
+
+        return sha256_hash.hexdigest()
+    except (FileNotFoundError, OSError):
+        return ""
+
+def _standalone_get_google_json_dict(image_path: str) -> dict | None:
+    """
+    Finds and reads all corresponding Google Takeout JSON metadata files,
+    merging them into a single dictionary.
+    """
+    directory = os.path.dirname(image_path)
+    # Get the directory's contents from our fast, cached helper
+    dir_contents = get_directory_contents(directory)
+    if not dir_contents:
+        return None
+
+    base, ext = os.path.splitext(image_path)
+    possible_json_paths = [
+        image_path + ".json",
+        base + ".json"
+    ]
+
+    if "-edited" in os.path.basename(base):
+        original_base = base.replace("-edited", "")
+        edited_path = original_base + ext + ".json"
+        possible_json_paths.append(edited_path)
+
+    possible_json_paths += [
+        base + '.supplemental-metadata.json',
+        base + '.supplemental_metadata.json',
+        base + ext + '.supplemental-metadata.json',
+        base + ext + '.supplemental_metadata.json'
+    ]
+
+    found_paths = [p for p in possible_json_paths if os.path.basename(p) in dir_contents]
+    if not found_paths:
+        return None
+
+    merged_data = {}
+    for json_path in found_paths:
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                merged_data.update(json.load(f))
+        except Exception:
+            continue
+
+    return merged_data if merged_data else None
 
 class PhotoProcessor:
     """Processes a single photo file to extract and structure data for the database."""
@@ -46,14 +136,6 @@ class PhotoProcessor:
             # The datetime is AWARE. Convert it to the local timezone.
             return dt_obj.astimezone(target_tz)
 
-    def _hash_file_content(self, filepath):
-        """Computes the SHA256 hash of a file's content."""
-        sha256_hash = hashlib.sha256()
-        with open(filepath, "rb") as f:
-            for byte_block in iter(lambda: f.read(4096), b""):
-                sha256_hash.update(byte_block)
-        return sha256_hash.hexdigest()
-
     def _get_exiftool_batch_dict(self, filepaths: list[str]) -> list[dict]:
         """
         Extracts metadata from a BATCH of files using a single exiftool call.
@@ -61,11 +143,25 @@ class PhotoProcessor:
         try:
             # Pass all filepaths to a single exiftool command.
             # It will return a list of JSON objects, one for each file.
+
+            required_tags = [
+                "-MIMEType",
+                "-FileSize",
+                "-DateTimeOriginal",
+                "-OffsetTimeOriginal",
+                "-CreateDate",
+                "-FileModifyDate",
+                "-GPSLatitude",
+                "-GPSLongitude",
+                "-AllDates",
+            ]
+
             args = [
                 "exiftool",
                 "-api", "QuickTimeUTC",  # ADDED: Essential for correct video time conversion
                 "-d", "%Y-%m-%dT%H:%M:%S%:z",  # This format is correct
                 "-G", "-n", "-json",
+                *required_tags,
                 *filepaths
             ]
             result = subprocess.run(args, check=True, capture_output=True, text=True)
@@ -77,47 +173,6 @@ class PhotoProcessor:
             print(f"Warning: Could not get exiftool data for a batch: {e}")
             # Return an empty list of the same size so the caller can map results.
             return [{} for _ in filepaths]
-
-    def _get_google_json_dict(self, image_path):
-        """
-        Finds and reads all corresponding Google Takeout JSON metadata files,
-        merging them into a single dictionary.
-        """
-        base, ext = os.path.splitext(image_path)
-        possible_json_paths = [
-            image_path + ".json",  # IMG_1234.JPG.json
-            base + ".json"  # IMG_1234.json
-        ]
-
-        # Handle cases like 'IMG_1234-edited.JPG' -> 'IMG_1234.JPG.json'
-        if "-edited" in os.path.basename(base):
-            original_base = base.replace("-edited", "")
-            edited_path = original_base + ext + ".json"
-            possible_json_paths.append(edited_path)
-
-        # Handle cases like +'.supplemental-metadata.json'
-        possible_json_paths += [
-            base + '.supplemental-metadata.json',  # IMG_1234.supplemental-metadata.json
-            base + '.supplemental_metadata.json',  # IMG_1234.supplemental_metadata.json
-            base + ext + '.supplemental-metadata.json',  # IMG_1234.JPG.supplemental-metadata.json
-            base + ext + '.supplemental_metadata.json'  # IMG_1234.JPG.supplemental_metadata.json
-        ]
-
-        # Check all possible paths
-        found_paths = [p for p in possible_json_paths if os.path.exists(p)]
-        if not found_paths:
-            return None
-
-        # Merge data from all found JSON files
-        merged_data = {}
-        for json_path in found_paths:
-            try:
-                with open(json_path, 'r', encoding='utf-8') as f:
-                    merged_data.update(json.load(f))
-            except Exception:
-                continue  # Ignore errors in individual JSON files
-
-        return merged_data if merged_data else None
 
     def _to_datetime(self, date_str: str) -> datetime | None:
         """
@@ -199,34 +254,51 @@ class PhotoProcessor:
 
     def process_batch(self, filepaths: list[str]) -> dict[str, dict]:
         """
-        Processes a BATCH of files and returns a dictionary mapping
-        filepath -> structured data.
+        Processes a BATCH of files using a pipeline model to overlap I/O and CPU work.
         """
-        results = {}
+        # Step 1: Get all exif data in one go (fast I/O for metadata).
         all_raw_exif = self._get_exiftool_batch_dict(filepaths)
         exif_map = {os.path.abspath(d.get('SourceFile')): d for d in all_raw_exif}
 
-        for filepath in filepaths:
-            if not os.path.exists(filepath):
-                continue
+        results = {}
+        hash_futures = {}
 
-            raw_exif_dict = exif_map.get(filepath)
-            google_json_dict = self._get_google_json_dict(filepath)
+        with ThreadPoolExecutor() as executor:
+            # Step 2: Dispatch all the heavy hashing jobs to the background threads.
+            # The main thread does NOT wait here.
+            for path in filepaths:
+                if os.path.exists(path):
+                    future = executor.submit(_hash_file_partially, path)
+                    hash_futures[path] = future
 
-            # The new structure separates data by its source
-            results[filepath] = {
-                "media_file": {
-                    "file_hash": self._hash_file_content(filepath),
-                    "mime_type": raw_exif_dict.get("File:MIMEType", "unknown/unknown") if raw_exif_dict else "unknown/unknown",
-                    "file_size": raw_exif_dict.get("File:FileSize", 0) if raw_exif_dict else os.path.getsize(filepath),
-                },
-                "exif_metadata": {
-                    "parsed": self._parse_key_exif_fields(raw_exif_dict),
-                    "raw": raw_exif_dict
-                } if raw_exif_dict else None,
-                "google_metadata": {
-                    "parsed": self._parse_key_google_fields(google_json_dict),
-                    "raw": google_json_dict
-                } if google_json_dict else None
-            }
+            # Step 3: While hashing runs in the background, do the other, faster work.
+            for path in filepaths:
+                if not os.path.exists(path):
+                    continue
+
+                # Get data that's already available or fast to access
+                raw_exif_dict = exif_map.get(path)
+                google_json_dict = _standalone_get_google_json_dict(path)
+
+                # Step 4: Now, get the hash result. If it's not ready, this line will
+                # wait. But much of the waiting has already happened in the background.
+                file_hash = hash_futures[path].result()
+
+                # Assemble the final dictionary entry
+                results[path] = {
+                    "media_file": {
+                        "file_hash": file_hash,
+                        "mime_type": raw_exif_dict.get("File:MIMEType",
+                                                       "unknown/unknown") if raw_exif_dict else "unknown/unknown",
+                        "file_size": raw_exif_dict.get("File:FileSize", 0) if raw_exif_dict else os.path.getsize(path),
+                    },
+                    "exif_metadata": {
+                        "parsed": self._parse_key_exif_fields(raw_exif_dict),
+                        "raw": raw_exif_dict
+                    } if raw_exif_dict else None,
+                    "google_metadata": {
+                        "parsed": self._parse_key_google_fields(google_json_dict),
+                        "raw": google_json_dict
+                    } if google_json_dict else None
+                }
         return results
