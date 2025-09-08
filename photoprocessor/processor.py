@@ -6,8 +6,12 @@ from datetime import datetime, timezone
 import magic
 from timezonefinder import TimezoneFinder
 from zoneinfo import ZoneInfo
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from functools import lru_cache
+
+import imagehash
+import videohash
+from PIL import Image
 
 @lru_cache(maxsize=256)
 def get_directory_contents(directory_path: str) -> set:
@@ -21,16 +25,32 @@ def get_directory_contents(directory_path: str) -> set:
     except (FileNotFoundError, NotADirectoryError):
         return set()
 
-def _standalone_hash_file_content(filepath: str) -> str:
-    """Computes the SHA256 hash of a file's content."""
-    sha256_hash = hashlib.sha256()
+def _perceptual_image_hash(image_path: str) -> str | None:
+    """
+    Generates a perceptual hash for an image file using the imagehash library.
+    This function is optimized for speed and should handle most common image formats.
+    """
     try:
-        with open(filepath, "rb") as f:
-            for byte_block in iter(lambda: f.read(4096), b""):
-                sha256_hash.update(byte_block)
-        return sha256_hash.hexdigest()
-    except FileNotFoundError:
-        return "" # Return empty string if file disappears during processing
+        with Image.open(image_path) as img:
+            # create a thumbnail for faster processing
+            img.thumbnail((256, 256))
+            # Use average hash (aHash) for speed; other options include phash, dhash, whash
+            hash_value = imagehash.phash(img)
+            return str(hash_value)
+    except (FileNotFoundError, OSError):
+        return None
+
+def _perceptual_video_hash(video_path: str) -> str | None:
+    """
+    Generates a perceptual hash for a video file using the videohash library.
+    This function extracts keyframes and computes a hash based on them.
+    """
+    try:
+        # videohash requires the file to be accessible and a valid video format
+        hash_value = videohash.VideoHash(video_path, frame_interval=0.1).hash
+        return str(hash_value)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
 
 def _hash_file_partially(filepath: str, chunk_size=1024 * 1024) -> str:
     """
@@ -270,7 +290,14 @@ class PhotoProcessor:
             # The main thread does NOT wait here.
             for path in filepaths:
                 if os.path.exists(path):
-                    future = executor.submit(_hash_file_partially, path)
+                    mime_type = exif_map.get(path, {}).get("File:MIMEType", "")
+                    if mime_type.startswith("image/"):
+                        future = executor.submit(_perceptual_image_hash, path)
+                    elif mime_type.startswith("video/"):
+                        future = executor.submit(_perceptual_video_hash, path)
+                    else:
+                        print(f"Info: Unknown MIME type '{mime_type}' for file '{path}'. Using partial file hash.")
+                        future = executor.submit(_hash_file_partially, path)
                     hash_futures[path] = future
 
             # Step 3: While hashing runs in the background, do the other, faster work.
