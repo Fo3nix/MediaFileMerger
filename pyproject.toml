@@ -20,7 +20,7 @@ dependencies = [
     "timezonefinder (>=8.0.0,<9.0.0)",
     "tzdata (>=2025.2,<2026.0)",
     "imagehash (>=4.3.2,<5.0.0)",
-    "videohash (>=3.0.1,<4.0.0)",
+    "opencv-python (>=4.12.0.88,<5.0.0.0)",
 ]
 
 

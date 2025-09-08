@@ -10,7 +10,8 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from functools import lru_cache
 
 import imagehash
-import videohash
+import cv2
+import hashlib
 from PIL import Image
 
 @lru_cache(maxsize=256)
@@ -40,17 +41,56 @@ def _perceptual_image_hash(image_path: str) -> str | None:
     except (FileNotFoundError, OSError):
         return None
 
-def _perceptual_video_hash(video_path: str) -> str | None:
+def _perceptual_video_hash(video_path: str, num_frames = 5) -> str | None:
     """
     Generates a perceptual hash for a video file using the videohash library.
     This function extracts keyframes and computes a hash based on them.
     """
+    """
+        Generates a visual hash for a video file by sampling frames.
+        """
+    cap = None
     try:
-        # videohash requires the file to be accessible and a valid video format
-        hash_value = videohash.VideoHash(video_path, frame_interval=0.1).hash
-        return str(hash_value)
-    except (FileNotFoundError, OSError, ValueError):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames < num_frames:
+            num_frames = total_frames
+
+        frame_hashes = []
+        # Calculate frame indices to sample evenly across the video
+        sample_indices = [int(i * total_frames / num_frames) for i in range(num_frames)]
+
+        for frame_idx in sample_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if ret:
+                # Convert frame from OpenCV's BGR format to Pillow's RGB format
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(rgb_frame)
+
+                # Generate a perceptual hash for the frame
+                frame_hash = imagehash.phash(img)
+                frame_hashes.append(str(frame_hash))
+
+        if not frame_hashes:
+            return None
+
+        # Combine all frame hashes into a single string
+        combined_hash_string = "".join(frame_hashes)
+
+        # Create a final, fixed-length hash of the combined string
+        final_hash = hashlib.sha256(combined_hash_string.encode()).hexdigest()
+        return final_hash
+
+    except Exception as e:
+        print(f"Warning: Could not process video {video_path}. Error: {e}")
         return None
+    finally:
+        if cap:
+            cap.release()
 
 def _hash_file_partially(filepath: str, chunk_size=1024 * 1024) -> str:
     """
