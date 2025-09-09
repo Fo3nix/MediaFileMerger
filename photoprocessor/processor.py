@@ -14,6 +14,7 @@ import imagehash
 import cv2
 import hashlib
 from PIL import Image
+import re
 
 @lru_cache(maxsize=256)
 def get_directory_contents(directory_path: str) -> set:
@@ -27,6 +28,33 @@ def get_directory_contents(directory_path: str) -> set:
     except (FileNotFoundError, NotADirectoryError):
         return set()
 
+def _validate_gps(lat, lon) -> bool:
+    """Validates GPS coordinates."""
+    if lat is None or lon is None:
+        return False
+    if abs(lat) < 1e-6 and abs(lon) < 1e-6:
+        return False
+    if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        return False
+    return True
+
+def _cryptographic_image_hash(img_obj: Image.Image) -> str | None:
+    """
+    Generates a SHA-256 hash of the raw pixel data of an image.
+    This hash is extremely strict: only pixel-for-pixel identical images
+    will produce the same hash.
+    """
+    if not img_obj:
+        return None
+    try:
+        # Convert the image to its raw pixel data (bytes)
+        pixel_data = img_obj.tobytes()
+        # Create a SHA-256 hash of the pixel data
+        return hashlib.sha256(pixel_data).hexdigest()
+    except Exception as e:
+        print(f"Warning: Could not generate cryptographic hash. Error: {e}")
+        return None
+
 def _perceptual_image_hash(image_path: str) -> str | None:
     """
     Generates a perceptual hash for an image file using the imagehash library.
@@ -35,12 +63,63 @@ def _perceptual_image_hash(image_path: str) -> str | None:
     try:
         with Image.open(image_path) as img:
             # create a thumbnail for faster processing
-            img.thumbnail((256, 256))
+            img.thumbnail((512, 512))
             # Use average hash (aHash) for speed; other options include phash, dhash, whash
             hash_value = imagehash.phash(img)
             return str(hash_value)
     except (FileNotFoundError, OSError):
         return None
+
+def _strict_video_hash(video_path: str, num_frames=10) -> str | None:
+    """
+    Generates a strict visual hash for a video file by cryptographically
+    hashing the pixel data of several evenly-sampled frames.
+    """
+    cap = None
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            return None
+        if total_frames < num_frames:
+            num_frames = total_frames
+
+        frame_hashes = []
+        # Sample frames evenly across the video
+        sample_indices = [int(i * (total_frames - 1) / (num_frames - 1)) for i in range(num_frames)] if num_frames > 1 else [0]
+
+        for frame_idx in sample_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if ret:
+                # Convert frame to a Pillow Image object
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(rgb_frame)
+
+                # Generate a cryptographic hash for the frame's pixel data
+                pixel_data = img.tobytes()
+                frame_hash = hashlib.sha256(pixel_data).hexdigest()
+                frame_hashes.append(frame_hash)
+
+        if not frame_hashes:
+            return None
+
+        # Combine all frame hashes into a single string
+        combined_hash_string = "".join(frame_hashes)
+
+        # Create a final, fixed-length hash of the combined string
+        final_hash = hashlib.sha256(combined_hash_string.encode()).hexdigest()
+        return final_hash
+
+    except Exception as e:
+        print(f"Warning: Could not process video {video_path}. Error: {e}")
+        return None
+    finally:
+        if cap:
+            cap.release()
 
 def _perceptual_video_hash(video_path: str, num_frames = 5) -> str | None:
     """
@@ -116,41 +195,39 @@ def _hash_file_partially(filepath: str, chunk_size=1024 * 1024) -> str:
     except (FileNotFoundError, OSError):
         return ""
 
+
 def _standalone_get_google_json_dict(image_path: str) -> dict | None:
     """
-    Finds and reads all corresponding Google Takeout JSON metadata files,
-    merging them into a single dictionary.
+    Finds and reads all corresponding Google Takeout JSON metadata files
+    using regex, merging them into a single dictionary.
     """
     directory = os.path.dirname(image_path)
-    # Get the directory's contents from our fast, cached helper
     dir_contents = get_directory_contents(directory)
     if not dir_contents:
         return None
 
-    base, ext = os.path.splitext(image_path)
-    possible_json_paths = [
-        image_path + ".json",
-        base + ".json"
-    ]
+    # Get the filename without its extension
+    base_filename = os.path.splitext(os.path.basename(image_path))[0]
 
-    if "-edited" in os.path.basename(base):
-        original_base = base.replace("-edited", "")
-        edited_path = original_base + ext + ".json"
-        possible_json_paths.append(edited_path)
+    # Handle Google's "-edited" suffix by looking for the original name
+    if "-edited" in base_filename:
+        base_filename = base_filename.replace("-edited", "")
 
-    possible_json_paths += [
-        base + '.supplemental-metadata.json',
-        base + '.supplemental_metadata.json',
-        base + ext + '.supplemental-metadata.json',
-        base + ext + '.supplemental_metadata.json'
-    ]
+    # Create a regex pattern to match:
+    # ^                  - Start of the string
+    # (re.escape(...))   - The literal base filename
+    # .* - Any characters (the "SOMETHING")
+    # \.json$            - Ending with exactly ".json"
+    pattern = re.compile(rf"^{re.escape(base_filename)}.*\.json$")
 
-    found_paths = [p for p in possible_json_paths if os.path.basename(p) in dir_contents]
-    if not found_paths:
+    # Find all matching files in the directory
+    found_files = [f for f in dir_contents if pattern.match(f)]
+    if not found_files:
         return None
 
     merged_data = {}
-    for json_path in found_paths:
+    for filename in found_files:
+        json_path = os.path.join(directory, filename)
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
                 merged_data.update(json.load(f))
@@ -210,20 +287,16 @@ class PhotoProcessor:
             required_tags = [
                 "-MIMEType",
                 "-FileSize",
-                "-DateTimeOriginal",
-                "-OffsetTimeOriginal",
-                "-CreateDate",
-                "-FileModifyDate",
                 "-GPSLatitude",
                 "-GPSLongitude",
-                "-AllDates",
+                "-time:all"
             ]
 
             args = [
                 "exiftool",
                 "-api", "QuickTimeUTC",  # ADDED: Essential for correct video time conversion
                 "-d", "%Y-%m-%dT%H:%M:%S%:z",  # This format is correct
-                "-G", "-n", "-json",
+                "-G", "-n", "-json", "-a",
                 *required_tags,
                 *filepaths
             ]
@@ -242,7 +315,7 @@ class PhotoProcessor:
         Safely converts a string to a datetime object.
         It returns a naive object, which will be made aware later if possible.
         """
-        if not date_str or not isinstance(date_str, str):
+        if not date_str or not isinstance(date_str, str) or date_str == "0000:00:00 00:00:00":
             return None
         try:
             iso_str = date_str.replace(" ", "T")
@@ -276,11 +349,33 @@ class PhotoProcessor:
             return None
 
         date_taken = self._to_datetime(self._get_optional(raw_exif, [
-                ("EXIF:DateTimeOriginal", "EXIF:OffsetTimeOriginal"),
-                "EXIF:DateTimeOriginal", "XMP:DateTimeOriginal", "QuickTime:CreateDate", "EXIF:CreateDate", "File:FileModifyDate"
-            ]))
+            # The absolute best: original date and time with its specific timezone offset.
+            ("EXIF:DateTimeOriginal", "EXIF:OffsetTimeOriginal"),
+            "EXIF:DateTimeOriginal",
+            # Very reliable UTC timestamp directly from the GPS satellite signal.
+            ("GPS:GPSDateStamp", "GPS:GPSTimeStamp"),
+            # The primary XMP tag, often mirrors the EXIF tag.
+            "XMP:DateTimeOriginal",
+            # QuickTime tags are often the most accurate for videos. CreationDate can include a timezone.
+            "QuickTime:CreationDate",
+            "Keys:CreationDate",  # Found in Apple device videos (MOV)
+            "UserData:DateTimeOriginal",  # Found in some MP4 containers
+            "QuickTime:CreateDate",
+            # Generic create dates, good fallbacks if originals are missing.
+            "EXIF:CreateDate",
+            "XMP:CreateDate",
+            # These can reflect edit times, not capture times, so they are lower priority.
+            "EXIF:ModifyDate",
+            "XMP:ModifyDate",
+            "QuickTime:ModifyDate",
+        ]))
         gps_latitude = self._get_optional(raw_exif, ["EXIF:GPSLatitude", "Composite:GPSLatitude"])
         gps_longitude = self._get_optional(raw_exif, ["EXIF:GPSLongitude", "Composite:GPSLongitude"])
+
+        # validate gps
+        if not _validate_gps(gps_latitude, gps_longitude):
+            gps_latitude = None
+            gps_longitude = None
 
         date_taken = self._get_aware_datetime(date_taken, gps_latitude, gps_longitude)
 
@@ -302,6 +397,11 @@ class PhotoProcessor:
         creation_time = google_json.get("photoTakenTime", {}).get("timestamp")
         latitude = google_json.get("geoData", {}).get("latitude")
         longitude = google_json.get("geoData", {}).get("longitude")
+
+        # validate gps
+        if not _validate_gps(latitude, longitude):
+            latitude = None
+            longitude = None
 
         # Create a timezone-aware datetime object in UTC
         utc_date = datetime.fromtimestamp(int(creation_time), tz=timezone.utc) if creation_time else None
@@ -383,10 +483,10 @@ class PhotoProcessor:
 
                     if mime_type.startswith("image/"):
                         # Hashing is CPU-bound and works on the pre-loaded image_obj
-                        file_hash = str(imagehash.phash(data["image_obj"]))
+                        file_hash = _cryptographic_image_hash(data["image_obj"])
                     elif mime_type.startswith("video/"):
                         # Video hashing is a separate process, can be done directly
-                        file_hash = _perceptual_video_hash(path)
+                        file_hash = _strict_video_hash(path)
                     else:
                         file_hash = _hash_file_partially(path)
 
