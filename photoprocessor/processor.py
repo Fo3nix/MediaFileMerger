@@ -351,7 +351,7 @@ class PhotoProcessor:
                     # Return a combined value (e.g., date + offset)
                     val = ''.join(str(data_dict[k]) for k in key)
                     return return_chosen(val, key)
-        return None
+        return return_chosen(None, None)
 
     def _parse_key_exif_fields(self, raw_exif):
         """Extracts just the key fields needed for the unified Metadata table."""
