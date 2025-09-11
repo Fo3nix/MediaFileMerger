@@ -361,19 +361,20 @@ class PhotoProcessor:
         date_str, chosen_key = self._get_optional(raw_exif, [
             "XMP:DateTimeOriginal",
             ("EXIF:DateTimeOriginal", "EXIF:OffsetTimeOriginal"),
+            "EXIF:DateTimeOriginal",
             "QuickTime:CreationDate",
             "QuickTime:CreateDate",
-            ("GPS:GPSDateStamp", "GPS:GPSTimeStamp"),
-            "EXIF:DateTimeOriginal",
+            "Composite:GPSDateTime",
             "Keys:CreationDate",
             "UserData:DateTimeOriginal",
             "XMP:CreateDate",
             "EXIF:CreateDate",
         ], return_chosen_key = True)
         default_timezone = None
-        if chosen_key == ("GPS:GPSDateStamp", "GPS:GPSTimeStamp") or chosen_key == "QuickTime:CreationDate" or chosen_key == "QuickTime:CreateDate":
+        if chosen_key == "Composite:GPSDateTime" or chosen_key == "QuickTime:CreationDate" or chosen_key == "QuickTime:CreateDate":
             default_timezone = timezone.utc
         date_taken = self._to_datetime(date_str, default_timezone=default_timezone)
+        date_taken_key = str(chosen_key)
 
         date_str, chosen_key = self._get_optional(raw_exif, [
             "XMP:ModifyDate",
@@ -382,6 +383,7 @@ class PhotoProcessor:
         ], return_chosen_key = True)
         default_timezone = timezone.utc if chosen_key == "QuickTime:ModifyDate" else None
         date_modified = self._to_datetime(date_str, default_timezone=default_timezone)
+        date_modified_key = str(chosen_key)
 
         gps_latitude = self._get_optional(raw_exif, ["EXIF:GPSLatitude", "Composite:GPSLatitude"])
         gps_longitude = self._get_optional(raw_exif, ["EXIF:GPSLongitude", "Composite:GPSLongitude"])
@@ -396,7 +398,9 @@ class PhotoProcessor:
 
         return {
             "date_taken": date_taken,
+            "date_taken_key": date_taken_key,
             "date_modified": date_modified,
+            "date_modified_key": date_modified_key,
             "gps_latitude": gps_latitude,
             "gps_longitude": gps_longitude,
         }

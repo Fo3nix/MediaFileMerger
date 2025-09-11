@@ -36,6 +36,38 @@ class AwareDateTime(TypeDecorator):
         # Parse the ISO 8601 string back into a timezone-aware datetime object.
         return datetime.datetime.fromisoformat(value)
 
+
+class FlexibleDateTime(TypeDecorator):
+    """
+    A custom SQLAlchemy type that stores both timezone-aware and naive
+    datetime objects.
+
+    - Aware datetimes are stored as ISO 8601 strings with timezone.
+      e.g., "2025-09-11T14:10:28+00:00"
+    - Naive datetimes are stored as ISO 8601 strings without timezone.
+      e.g., "2025-09-11T16:10:28"
+    """
+    impl = String
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        # This is called when sending data TO the database.
+        if value is None:
+            return None
+        if not isinstance(value, datetime.datetime):
+            raise TypeError("FlexibleDateTime column requires datetime objects")
+
+        # This no longer raises an error if the datetime is naive
+        return value.isoformat()
+
+    def process_result_value(self, value, dialect):
+        # This is called when receiving data FROM the database.
+        if value is None:
+            return None
+
+        # This correctly parses both aware and naive ISO strings.
+        return datetime.datetime.fromisoformat(value)
+
 ## DATABASE MODELS
 class Owner(Base):
     """Represents an owner. Links to locations via MediaOwnership."""
@@ -115,8 +147,10 @@ class Metadata(Base):
     source = Column(String, nullable=False)  # e.g., 'exif', 'google_json'
 
     # Key parsed fields for quick access and merging
-    date_taken = Column(DateTime)
-    date_modified = Column(DateTime)
+    date_taken = Column(FlexibleDateTime)
+    date_taken_key = Column(String) # e.g. "EXIF:DateTimeOriginal"
+    date_modified = Column(FlexibleDateTime)
+    date_modified_key = Column(String)
     gps_latitude = Column(REAL)
     gps_longitude = Column(REAL)
 
