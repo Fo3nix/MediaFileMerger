@@ -96,32 +96,45 @@ def _generate_exiftool_args_for_file(metadata: Dict[str, Any]) -> List[str]:
     # --- Date Taken ---
     date_taken = metadata.get("date_taken")
     if date_taken and isinstance(date_taken, datetime):
+        # Format for EXIF/File dates (local time, no offset)
         local_time_str = date_taken.strftime('%Y:%m:%d %H:%M:%S')
-        offset_str = date_taken.strftime('%z')
-        offset_str_formatted = f"{offset_str[:3]}:{offset_str[3:]}"
-        utc_date = date_taken.astimezone(timezone.utc)
-        utc_time_str = utc_date.strftime('%Y:%m:%d %H:%M:%S')
         args.extend([
             f"-EXIF:DateTimeOriginal={local_time_str}",
             f"-EXIF:CreateDate={local_time_str}",
-            f"-EXIF:OffsetTimeOriginal={offset_str_formatted}",
-            f"-QuickTime:CreateDate={utc_time_str}",
-            f"-Keys:CreationDate={utc_time_str}",
             f"-FileCreateDate={local_time_str}",
         ])
+
+        # If the date is timezone-aware, write additional offset and UTC tags
+        if date_taken.tzinfo:
+            offset_str = date_taken.strftime('%z')
+            offset_str_formatted = f"{offset_str[:3]}:{offset_str[3:]}"
+            utc_date = date_taken.astimezone(timezone.utc)
+            utc_time_str = utc_date.strftime('%Y:%m:%d %H:%M:%S')
+
+            args.extend([
+                f"-EXIF:OffsetTimeOriginal={offset_str_formatted}",
+                f"-XMP:DateTimeOriginal={date_taken.isoformat()}",  # XMP uses full ISO 8601
+                f"-QuickTime:CreateDate={utc_time_str}",
+                f"-Keys:CreationDate={utc_time_str}",
+            ])
 
     # --- Date Modified ---
     date_modified = metadata.get("date_modified")
     if date_modified and isinstance(date_modified, datetime):
         local_mod_time_str = date_modified.strftime('%Y:%m:%d %H:%M:%S')
-        utc_mod_date = date_modified.astimezone(timezone.utc)
-        utc_mod_time_str = utc_mod_date.strftime('%Y:%m:%d %H:%M:%S')
         args.extend([
             f"-EXIF:ModifyDate={local_mod_time_str}",
-            f"-XMP:ModifyDate={local_mod_time_str}",
-            f"-QuickTime:ModifyDate={utc_mod_time_str}",
             f"-FileModifyDate={local_mod_time_str}",
         ])
+
+        # If the date is aware, write UTC and XMP tags
+        if date_modified.tzinfo:
+            utc_mod_date = date_modified.astimezone(timezone.utc)
+            utc_mod_time_str = utc_mod_date.strftime('%Y:%m:%d %H:%M:%S')
+            args.extend([
+                f"-XMP:ModifyDate={date_modified.isoformat()}",
+                f"-QuickTime:ModifyDate={utc_mod_time_str}",
+            ])
 
     # --- GPS and other tags ---
     for key, value in metadata.items():

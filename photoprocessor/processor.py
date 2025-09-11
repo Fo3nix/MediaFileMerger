@@ -243,7 +243,7 @@ class PhotoProcessor:
         """Initializes the PhotoProcessor and its tools."""
         self.tf = TimezoneFinder()
 
-    def _get_aware_datetime(self, dt_obj: datetime, lat: float, lon: float) -> datetime | None:
+    def _process_datetime(self, dt_obj: datetime, lat: float, lon: float) -> datetime | None:
         """
         Takes a datetime object and ensures it is aware and in the correct
         local timezone based on coordinates.
@@ -251,20 +251,16 @@ class PhotoProcessor:
         - If the object is naive, it is localized to the target timezone.
         - If the object is already aware (e.g., in UTC), it is converted to the target timezone.
         """
-        # If we don't have a datetime or coordinates, we can't proceed.
+
         if not dt_obj:
             return None
-        if lat is None or lon is None:
-            if dt_obj.tzinfo is None:
-                return None
 
+        if lat is None or lon is None:
             return dt_obj
 
         # Find the target timezone name from the coordinates
         tz_name = self.tf.timezone_at(lng=lon, lat=lat)
         if not tz_name:
-            if dt_obj.tzinfo is None:
-                return None
             return dt_obj  # Return original if no timezone is found
 
         target_tz = ZoneInfo(tz_name)
@@ -314,7 +310,7 @@ class PhotoProcessor:
             # Return an empty list of the same size so the caller can map results.
             return [{} for _ in filepaths]
 
-    def _to_datetime(self, date_str: str) -> datetime | None:
+    def _to_datetime(self, date_str: str, default_timezone: timezone) -> datetime | None:
         """
         Safely converts a string to a datetime object.
         It returns a naive object, which will be made aware later if possible.
@@ -327,24 +323,34 @@ class PhotoProcessor:
                 iso_str = iso_str.replace(':', '-', 2)
             # This will return an AWARE object if offset is in the string,
             # or a NAIVE object if it's not.
-            return datetime.fromisoformat(iso_str)
+            dt_obj = datetime.fromisoformat(iso_str)
+
+            if dt_obj.tzinfo is None and default_timezone is not None:
+                dt_obj = dt_obj.replace(tzinfo=default_timezone)
+
+            return dt_obj
         except (ValueError, TypeError):
             print(f"Warning: Could not parse date string: '{date_str}'")
             return None
 
-    def _get_optional(self, data_dict, keys):
+    def _get_optional(self, data_dict, keys, return_chosen_key = False):
         """Helper function to get in-order keys from a dictionary, or combinations of keys.
             keys is a list of str or tuple of str.
         """
+
+        def return_chosen(value, key):
+            return (value, key) if return_chosen_key else value
+
         for key in keys:
             if isinstance(key, str):
                 if key in data_dict:
-                    return data_dict[key]
+                    return return_chosen(data_dict[key], key)
             elif isinstance(key, tuple):
                 # Check if all keys in the tuple exist
                 if all(k in data_dict for k in key):
                     # Return a combined value (e.g., date + offset)
-                    return ''.join(str(data_dict[k]) for k in key)
+                    val = ''.join(str(data_dict[k]) for k in key)
+                    return return_chosen(val, key)
         return None
 
     def _parse_key_exif_fields(self, raw_exif):
@@ -352,29 +358,31 @@ class PhotoProcessor:
         if not raw_exif:
             return None
 
-        date_taken = self._to_datetime(self._get_optional(raw_exif, [
-            # The absolute best: original date and time with its specific timezone offset.
-            ("EXIF:DateTimeOriginal", "EXIF:OffsetTimeOriginal"),
-            "EXIF:DateTimeOriginal",
-            # Very reliable UTC timestamp directly from the GPS satellite signal.
-            ("GPS:GPSDateStamp", "GPS:GPSTimeStamp"),
-            # The primary XMP tag, often mirrors the EXIF tag.
+        date_str, chosen_key = self._get_optional(raw_exif, [
             "XMP:DateTimeOriginal",
-            # QuickTime tags are often the most accurate for videos. CreationDate can include a timezone.
+            ("EXIF:DateTimeOriginal", "EXIF:OffsetTimeOriginal"),
             "QuickTime:CreationDate",
-            "Keys:CreationDate",  # Found in Apple device videos (MOV)
-            "UserData:DateTimeOriginal",  # Found in some MP4 containers
-            "QuickTime:CreateDate",
-            # Generic create dates, good fallbacks if originals are missing.
+            ("GPS:GPSDateStamp", "GPS:GPSTimeStamp"),
+            "EXIF:DateTimeOriginal",
+            "Keys:CreationDate",
+            "UserData:DateTimeOriginal",
             "EXIF:CreateDate",
+            "QuickTime:CreateDate",
             "XMP:CreateDate",
-        ]))
+        ], return_chosen_key = True)
+        default_timezone = None
+        if chosen_key == ("GPS:GPSDateStamp", "GPS:GPSTimeStamp") or chosen_key == "QuickTime:CreationDate":
+            default_timezone = timezone.utc
+        date_taken = self._to_datetime(date_str, default_timezone=default_timezone)
 
-        date_modified = self._to_datetime(self._get_optional(raw_exif, [
-            "EXIF:ModifyDate",
+        date_str, chosen_key = self._get_optional(raw_exif, [
             "XMP:ModifyDate",
             "QuickTime:ModifyDate",
-        ]))
+            "EXIF:ModifyDate",
+        ], return_chosen_key = True)
+        default_timezone = timezone.utc if chosen_key == "QuickTime:ModifyDate" else None
+        date_modified = self._to_datetime(date_str, default_timezone=default_timezone)
+
         gps_latitude = self._get_optional(raw_exif, ["EXIF:GPSLatitude", "Composite:GPSLatitude"])
         gps_longitude = self._get_optional(raw_exif, ["EXIF:GPSLongitude", "Composite:GPSLongitude"])
 
@@ -383,8 +391,8 @@ class PhotoProcessor:
             gps_latitude = None
             gps_longitude = None
 
-        date_taken = self._get_aware_datetime(date_taken, gps_latitude, gps_longitude)
-        date_modified = self._get_aware_datetime(date_modified, gps_latitude, gps_longitude)
+        date_taken = self._process_datetime(date_taken, gps_latitude, gps_longitude)
+        date_modified = self._process_datetime(date_modified, gps_latitude, gps_longitude)
 
         return {
             "date_taken": date_taken,
@@ -415,7 +423,7 @@ class PhotoProcessor:
         utc_date = datetime.fromtimestamp(int(creation_time), tz=timezone.utc) if creation_time else None
 
         # Now, use the helper to convert the UTC date to the photo's local timezone
-        local_date = self._get_aware_datetime(utc_date, latitude, longitude)
+        local_date = self._process_datetime(utc_date, latitude, longitude)
 
         return {
             "date_taken": local_date,

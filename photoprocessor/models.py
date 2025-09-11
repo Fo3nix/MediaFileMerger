@@ -115,8 +115,8 @@ class Metadata(Base):
     source = Column(String, nullable=False)  # e.g., 'exif', 'google_json'
 
     # Key parsed fields for quick access and merging
-    date_taken = Column(AwareDateTime)
-    date_modified = Column(AwareDateTime)
+    date_taken = Column(DateTime)
+    date_modified = Column(DateTime)
     gps_latitude = Column(REAL)
     gps_longitude = Column(REAL)
 
