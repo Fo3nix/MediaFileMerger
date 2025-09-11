@@ -294,7 +294,7 @@ class PhotoProcessor:
 
             args = [
                 "exiftool",
-                "-api", "QuickTimeUTC",  # ADDED: Essential for correct video time conversion
+                # "-api", "QuickTimeUTC",  # Turns QuickTime dates into my local timezone
                 "-d", "%Y-%m-%dT%H:%M:%S%:z",  # This format is correct
                 "-G", "-n", "-json", "-a",
                 *required_tags,
@@ -362,16 +362,16 @@ class PhotoProcessor:
             "XMP:DateTimeOriginal",
             ("EXIF:DateTimeOriginal", "EXIF:OffsetTimeOriginal"),
             "QuickTime:CreationDate",
+            "QuickTime:CreateDate",
             ("GPS:GPSDateStamp", "GPS:GPSTimeStamp"),
             "EXIF:DateTimeOriginal",
             "Keys:CreationDate",
             "UserData:DateTimeOriginal",
-            "EXIF:CreateDate",
-            "QuickTime:CreateDate",
             "XMP:CreateDate",
+            "EXIF:CreateDate",
         ], return_chosen_key = True)
         default_timezone = None
-        if chosen_key == ("GPS:GPSDateStamp", "GPS:GPSTimeStamp") or chosen_key == "QuickTime:CreationDate":
+        if chosen_key == ("GPS:GPSDateStamp", "GPS:GPSTimeStamp") or chosen_key == "QuickTime:CreationDate" or chosen_key == "QuickTime:CreateDate":
             default_timezone = timezone.utc
         date_taken = self._to_datetime(date_str, default_timezone=default_timezone)
 
