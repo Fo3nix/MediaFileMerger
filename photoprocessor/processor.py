@@ -273,6 +273,10 @@ class PhotoProcessor:
             # The datetime is NAIVE. Stamp it with the local timezone.
             return dt_obj.replace(tzinfo=target_tz)
         else:
+            # check if there are differences in offsets (if dt_obj.utcoffset() is not None and not UTC)
+            if dt_obj.utcoffset() not in (None, timezone.utc.utcoffset(None)) and dt_obj.utcoffset() != target_tz.utcoffset(dt_obj):
+                print(f"Warning: Timezone offset mismatch. Original: {dt_obj.tzinfo}, Target: {target_tz}")
+
             # The datetime is AWARE. Convert it to the local timezone.
             return dt_obj.astimezone(target_tz)
 
@@ -364,7 +368,9 @@ class PhotoProcessor:
             # Generic create dates, good fallbacks if originals are missing.
             "EXIF:CreateDate",
             "XMP:CreateDate",
-            # These can reflect edit times, not capture times, so they are lower priority.
+        ]))
+
+        date_modified = self._to_datetime(self._get_optional(raw_exif, [
             "EXIF:ModifyDate",
             "XMP:ModifyDate",
             "QuickTime:ModifyDate",
@@ -378,9 +384,11 @@ class PhotoProcessor:
             gps_longitude = None
 
         date_taken = self._get_aware_datetime(date_taken, gps_latitude, gps_longitude)
+        date_modified = self._get_aware_datetime(date_modified, gps_latitude, gps_longitude)
 
         return {
             "date_taken": date_taken,
+            "date_modified": date_modified,
             "gps_latitude": gps_latitude,
             "gps_longitude": gps_longitude,
         }

@@ -63,6 +63,7 @@ def merge_metadata_for_export(main_source: models.Metadata, metadata_sources: Li
             return {}
         return {
             "date_taken": source.date_taken,
+            "date_modified": source.date_modified,
             "gps_latitude": source.gps_latitude,
             "gps_longitude": source.gps_longitude,
         }
@@ -91,6 +92,8 @@ def _generate_exiftool_args_for_file(metadata: Dict[str, Any]) -> List[str]:
     """Generates the list of ExifTool command-line args for a single file's metadata."""
     args = []
     tag_map = {"gps_latitude": "-GPSLatitude", "gps_longitude": "-GPSLongitude"}
+
+    # --- Date Taken ---
     date_taken = metadata.get("date_taken")
     if date_taken and isinstance(date_taken, datetime):
         local_time_str = date_taken.strftime('%Y:%m:%d %H:%M:%S')
@@ -103,11 +106,24 @@ def _generate_exiftool_args_for_file(metadata: Dict[str, Any]) -> List[str]:
             f"-EXIF:CreateDate={local_time_str}",
             f"-EXIF:OffsetTimeOriginal={offset_str_formatted}",
             f"-QuickTime:CreateDate={utc_time_str}",
-            f"-QuickTime:ModifyDate={utc_time_str}",
             f"-Keys:CreationDate={utc_time_str}",
-            f"-FileModifyDate={local_time_str}",
             f"-FileCreateDate={local_time_str}",
         ])
+
+    # --- Date Modified ---
+    date_modified = metadata.get("date_modified")
+    if date_modified and isinstance(date_modified, datetime):
+        local_mod_time_str = date_modified.strftime('%Y:%m:%d %H:%M:%S')
+        utc_mod_date = date_modified.astimezone(timezone.utc)
+        utc_mod_time_str = utc_mod_date.strftime('%Y:%m:%d %H:%M:%S')
+        args.extend([
+            f"-EXIF:ModifyDate={local_mod_time_str}",
+            f"-XMP:ModifyDate={local_mod_time_str}",
+            f"-QuickTime:ModifyDate={utc_mod_time_str}",
+            f"-FileModifyDate={local_mod_time_str}",
+        ])
+
+    # --- GPS and other tags ---
     for key, value in metadata.items():
         if key in tag_map and value is not None:
             args.append(f"{tag_map[key]}={value}")

@@ -96,11 +96,12 @@ def save_batch_to_db(db: Session, owner: models.Owner, batch_data: Dict) -> (Dic
                                                                          source=source_name).first()
                     parsed = source_data["parsed"]
                     if metadata_entry:
-                        metadata_entry.date_taken, metadata_entry.gps_latitude, metadata_entry.gps_longitude, metadata_entry.raw_data = parsed.get(
-                            "date_taken"), parsed.get("gps_latitude"), parsed.get("gps_longitude"), source_data["raw"]
+                        metadata_entry.date_taken, metadata_entry.date_modified, metadata_entry.gps_latitude, metadata_entry.gps_longitude, metadata_entry.raw_data = parsed.get(
+                            "date_taken"), parsed.get("date_modified"), parsed.get("gps_latitude"), parsed.get("gps_longitude"), source_data["raw"]
                     else:
                         db.add(models.Metadata(media_file=media_file_obj, location=location_obj, source=source_name,
                                                date_taken=parsed.get("date_taken"),
+                                               date_modified=parsed.get("date_modified"),
                                                gps_latitude=parsed.get("gps_latitude"),
                                                gps_longitude=parsed.get("gps_longitude"), raw_data=source_data["raw"]))
 

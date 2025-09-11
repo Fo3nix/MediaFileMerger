@@ -116,6 +116,7 @@ class Metadata(Base):
 
     # Key parsed fields for quick access and merging
     date_taken = Column(AwareDateTime)
+    date_modified = Column(AwareDateTime)
     gps_latitude = Column(REAL)
     gps_longitude = Column(REAL)
 
