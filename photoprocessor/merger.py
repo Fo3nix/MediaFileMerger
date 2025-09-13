@@ -90,7 +90,9 @@ class GPSMergeStep(MergeStep):
             if len(conflicting_values) > 1:
                 all_values = {reference_val} | conflicting_values
                 msg = (f"GPS coordinates from different sources are not close enough to be considered the same. "
-                       f"Found values: {sorted(list(all_values))}")
+                       f"Found values: {sorted(list(all_values))}"
+                       f"Source IDs: {[s.id for s in context.sources if getattr(s, field) in all_values]}"
+                       )
                 context.record_conflict(field, msg)
             else:
                 context.set_value(field, reference_val)
@@ -100,19 +102,42 @@ class DateTimeAndZoneMergeStep(BasicFieldMergeStep):
     """
     Merges date/time fields by establishing a single, canonical, timezone-aware datetime.
 
+    This step follows a prioritized hierarchy to resolve the final time and timezone,
+    handling various combinations of timezone-aware and naive datetime sources.
+
     The logic proceeds as follows:
-    1.  **Categorize Values**: All non-null datetime values are collected and separated into timezone-aware and naive lists.
 
-    2.  **No Aware Values (Naive Only)**:
-        a.  If all naive values are identical, the result is that single naive time. If GPS is available, it's localized to that timezone.
-        b.  If naive values differ and there is no GPS, it's an unresolvable conflict.
-        c.  If naive values differ and GPS is available, a heuristic is applied: it checks if the difference between the times can be explained by one being a naive UTC time and the other being a naive local time in the GPS-inferred timezone. If so, they are resolved. Otherwise, it's a conflict.
+    1.  **UTC Time Consolidation**: First, all non-null, timezone-aware datetime values are
+        converted to UTC. They must all represent the exact same moment in time (within a
+        2-second tolerance). If they conflict, an unresolvable conflict is recorded. This
+        establishes the definitive "when".
 
-    3.  **Aware Values Exist**:
-        a.  **UTC Consistency Check**: All aware values are converted to UTC. If they do not all represent the exact same moment in time, it is an unresolvable conflict.
-        b.  **Establish Canonical Timezone**: The GPS data is considered the source of truth for the local timezone.
-        c.  **Standardize**: The consistent UTC time is represented in the canonical (GPS-inferred) timezone. If no GPS is available, and the original values had conflicting offsets, it's a conflict about the true local time.
-        d.  **Validate Naive Values**: Any naive values are checked against the final, standardized aware value. They must match the local time of the aware value exactly. If not, they are considered a conflict.
+    2.  **Local Time Inference via Naive Time (Primary Method)**: The step then analyzes all
+        naive (timezone-unaware) datetime values.
+        -   If there is **exactly one unique naive time** across all sources, it is assumed
+            to be the correct **local time**. The timezone offset is calculated from the
+            difference between this local time and the consolidated UTC time. The final
+            result is a new, aware datetime using this inferred offset. This is the
+            preferred method for determining the correct timezone.
+
+    3.  **Fallback to GPS-Inferred Timezone**: If the primary method cannot be used (e.g.,
+        there are no naive times, or there are multiple conflicting naive times), the logic
+        falls back to using GPS coordinates, if they have been finalized by a previous step.
+        -   The timezone is determined from the latitude and longitude.
+        -   The final value is the consolidated UTC time localized to this GPS-inferred timezone.
+
+    4.  **Fallback to Original Timezone Offset**: If both naive time inference and GPS localization
+        are not possible, the logic examines the timezone offsets of the original aware sources.
+        -   If all aware sources share the **same timezone offset**, that offset is used to create
+            the final datetime from the consolidated UTC time.
+        -   If the original aware sources have conflicting offsets, it is an unresolvable conflict,
+            as the true local time cannot be determined.
+
+    5.  **Conflict Handling**: A conflict is recorded if:
+        -   Aware datetimes do not agree on the absolute UTC time.
+        -   Multiple, different naive datetimes exist, creating ambiguity about the local time.
+        -   Aware datetimes have different offsets, and there is no unique naive time or GPS
+            data to serve as a tie-breaker.
     """
 
     def __init__(self, field_name: str):
@@ -134,45 +159,55 @@ class DateTimeAndZoneMergeStep(BasicFieldMergeStep):
             return None
 
     def process(self, context: MergeContext):
-        values = [getattr(s, self.field_name) for s in context.sources if getattr(s, self.field_name) is not None]
-        if not values:
+        # Get all Metadata objects that have a value for the target field
+        sources_with_date = [s for s in context.sources if getattr(s, self.field_name) is not None]
+        if not sources_with_date:
             return
 
-        # Corrected type checking
-        if not all(isinstance(v, datetime) for v in values):
+        # Check that all values are datetime objects
+        if not all(isinstance(getattr(s, self.field_name), datetime) for s in sources_with_date):
             raise TypeError(f"All values for {self.field_name} must be datetime objects")
 
-        aware_values = [v for v in values if v.tzinfo is not None]
-        naive_values = [v for v in values if v.tzinfo is None]
+        # Separate the SOURCE OBJECTS into aware and naive lists
+        aware_sources = [s for s in sources_with_date if getattr(s, self.field_name).tzinfo is not None]
+        naive_sources = [s for s in sources_with_date if getattr(s, self.field_name).tzinfo is None]
+
         inferred_tz = self.infer_timezone(context)
 
-        if not aware_values:
-            self._process_only_naive(context, naive_values, inferred_tz)
+        if not aware_sources:
+            # Pass the list of source objects, not just values
+            self._process_only_naive(context, naive_sources, inferred_tz)
         else:
-            self._process_with_aware(context, aware_values, naive_values, inferred_tz)
+            # Pass both lists of source objects
+            self._process_with_aware(context, aware_sources, naive_sources, inferred_tz)
 
-
-    def _process_only_naive(self, context: MergeContext, naive_values: list[datetime], inferred_tz: ZoneInfo | None):
-        if not naive_values:
+    def _process_only_naive(self, context: MergeContext, naive_sources: list[models.Metadata],
+                            inferred_tz: ZoneInfo | None):
+        if not naive_sources:
             return
 
-        unique_naive_values = list(set(naive_values))
-        if len(unique_naive_values) == 1:
-            single_value = unique_naive_values[0]
+        # Group sources by their naive datetime value
+        unique_naive_groups = {}
+        for s in naive_sources:
+            unique_naive_groups.setdefault(getattr(s, self.field_name), []).append(s.id)
+
+        if len(unique_naive_groups) == 1:
+            # Success, all are the same
+            single_value = list(unique_naive_groups.keys())[0]
             if inferred_tz:
                 single_value = single_value.replace(tzinfo=inferred_tz)
             context.set_value(self.field_name, single_value)
             return
 
-        # Multiple distinct naive values
+        unique_naive_values = list(unique_naive_groups.keys())
         if not inferred_tz or len(unique_naive_values) != 2:
-            # Conflict if no GPS to help, or if more than 2 distinct times to compare
-            msg = (f"Found multiple distinct naive times {sorted(unique_naive_values)}, "
-                   "but cannot resolve them without GPS data or because there are more than two distinct values.")
+            conflicting_ids = sorted([s.id for s in naive_sources])
+            msg = (f"Found multiple distinct naive times {sorted(unique_naive_values)}, but cannot resolve them. "
+                   f"Source IDs: {conflicting_ids}")
             context.record_conflict(self.field_name, msg)
             return
 
-        # --- IMPLEMENTING YOUR HEURISTIC for exactly two differing naive times ---
+        # Heuristic with IDs
         t1, t2 = unique_naive_values[0], unique_naive_values[1]
         # We must use a sample datetime to get the offset, as it can depend on DST
         offset = inferred_tz.utcoffset(t1)
@@ -188,55 +223,86 @@ class DateTimeAndZoneMergeStep(BasicFieldMergeStep):
             utc_time = t2.replace(tzinfo=timezone.utc)
 
         if utc_time:
-            # Success. We found the correct UTC time. Standardize it to the inferred local timezone.
             final_value = utc_time.astimezone(inferred_tz)
             context.set_value(self.field_name, final_value)
         else:
-            # The difference cannot be explained by the timezone offset
-            msg = (f"The difference between naive times '{t1}' and '{t2}' "
-                   f"cannot be explained by the inferred timezone offset ({offset}).")
+            conflicting_ids = sorted([s.id for s in naive_sources])
+            offset = inferred_tz.utcoffset(t1)
+            msg = (f"The difference between naive times '{t1}' and '{t2}' cannot be explained "
+                   f"by the inferred timezone offset ({offset}). Source IDs: {conflicting_ids}")
             context.record_conflict(self.field_name, msg)
 
-    def _process_with_aware(self, context: MergeContext, aware_values: list[datetime], naive_values: list[datetime],
+    def _process_with_aware(self, context: MergeContext, aware_sources: list[models.Metadata],
+                            naive_sources: list[models.Metadata],
                             inferred_tz: ZoneInfo | None):
-        # 3a. UTC Consistency Check
-        utc_times = {v.astimezone(timezone.utc) for v in aware_values}
-        if len(utc_times) > 1:
-            sorted_utc_times = sorted([dt.isoformat() for dt in utc_times])
-            msg = f"Timezone-aware datetimes do not agree on the absolute UTC time. Found values: {sorted_utc_times}"
-            context.record_conflict(self.field_name, msg)
-            return
+        # Group source IDs by their UTC time
+        utc_groups = {}
+        for s in aware_sources:
+            utc_time = getattr(s, self.field_name).astimezone(timezone.utc)
+            utc_groups.setdefault(utc_time, []).append(s.id)
 
-        final_utc_time = utc_times.pop()
+        # UTC Consistency Check with tolerance
+        if len(utc_groups) > 1:
+            times = sorted(utc_groups.keys())
+            min_time, max_time = times[0], times[-1]
 
-        # 3b/c. Establish Canonical Timezone and Standardize
-        if inferred_tz:
-            # GPS is the truth. Standardize the final value to this timezone.
-            final_value = final_utc_time.astimezone(inferred_tz)
-        else:
-            # No GPS. Check if original offsets create ambiguity.
-            unique_offsets = {v.utcoffset() for v in aware_values}
-            if len(unique_offsets) > 1:
-                # Without GPS, we cannot resolve the "Germany vs Russia" problem. Conflict.
-                sorted_aware_values = sorted([dt.isoformat() for dt in aware_values])
-                msg = (f"Aware datetimes have different offsets, but no GPS data is available to determine the "
-                       f"correct local time. Found values: {sorted_aware_values}")
+            if (max_time - min_time) > timedelta(seconds=2):
+                report = {k.isoformat(): sorted(v) for k, v in utc_groups.items()}
+                msg = f"Timezone-aware datetimes do not agree on the absolute UTC time. Groups: {report}"
                 context.record_conflict(self.field_name, msg)
                 return
-            final_value = aware_values[0]  # All have same offset, so just use one
+
+        final_utc_time = min(utc_groups.keys())
+
+        # Group naive sources by their datetime value to find unique times
+        unique_naive_groups = {}
+        for s in naive_sources:
+            unique_naive_groups.setdefault(getattr(s, self.field_name), []).append(s.id)
+
+        final_value = None
+
+        # Case 1: Resolve using a single unique naive time as the local time reference.
+        # This handles your scenario where aware + naive times can determine the offset.
+        if len(unique_naive_groups) == 1:
+            unique_naive_time = list(unique_naive_groups.keys())[0]
+            offset = unique_naive_time - final_utc_time.replace(tzinfo=None)
+
+            try:
+                # Create a fixed-offset timezone from the calculated difference
+                inferred_tz_from_naive = timezone(offset)
+                final_value = final_utc_time.astimezone(inferred_tz_from_naive)
+            except ValueError:
+                msg = (f"The difference between aware UTC time '{final_utc_time.isoformat()}' and naive time "
+                       f"'{unique_naive_time.isoformat()}' resulted in an invalid timezone offset of '{offset}'.")
+                context.record_conflict(self.field_name, msg)
+                return
+
+        # Case 2: No naive times, or conflicting naive times. Fall back to using GPS or original offsets.
+        if final_value is None:
+            if inferred_tz:
+                # Use GPS as the source of truth for the timezone.
+                final_value = final_utc_time.astimezone(inferred_tz)
+            else:
+                # No GPS. Check if original aware sources had a consistent offset.
+                unique_offsets = {getattr(s, self.field_name).utcoffset() for s in aware_sources}
+                if len(unique_offsets) > 1:
+                    offsets_repr = sorted([o for o in unique_offsets if o is not None])
+                    msg = (f"Aware datetimes have conflicting offsets ({offsets_repr}), and no GPS or unique naive "
+                           f"time is available to determine the correct local timezone.")
+                    context.record_conflict(self.field_name, msg)
+                    return
+                # All original aware times have the same offset, so it's safe to use that zone.
+                final_value = final_utc_time.astimezone(getattr(aware_sources[0], self.field_name).tzinfo)
 
         context.set_value(self.field_name, final_value)
 
-        # 3d. Validate Naive Values
-        if naive_values:
-            for nv in set(naive_values):
-                if (nv.year, nv.month, nv.day, nv.hour, nv.minute, nv.second) != \
-                        (final_value.year, final_value.month, final_value.day,
-                         final_value.hour, final_value.minute, final_value.second):
-                    msg = (f"Naive time '{nv}' does not match the local time of the final, "
-                           f"consistent aware time '{final_value.strftime('%Y-%m-%d %H:%M:%S')}'")
-                    context.record_conflict(self.field_name, msg)
-
+        # If there were multiple distinct naive times initially, they represent an unresolvable conflict.
+        if len(unique_naive_groups) > 1:
+            conflicting_ids = sorted([s.id for s in naive_sources])
+            msg = (f"Found multiple distinct naive times {sorted(unique_naive_groups.keys())}, creating ambiguity. "
+                   f"While a final value was determined from higher-priority data, this conflict in the source is being noted. Chosen value: {final_value.isoformat()}. "
+                   f"Source IDs: {conflicting_ids}")
+            context.record_conflict(self.field_name, msg)
 
 # --- The Pipeline Orchestrator ---
 

@@ -144,17 +144,21 @@ def copy_file_task(src_dst_tuple: Tuple[str, str]):
     return src_dst_tuple[0], None
 
 
-def log_conflict(logger: logging.Logger, file_path: str, conflicts: Dict):
-    """Formats and logs a merge conflict message."""
-    conflict_details = []
-    for key, values in conflicts.items():
-        try:
-            sorted_values = sorted(list(values))
-        except TypeError:
-            sorted_values = sorted(list(values), key=str)
-        conflict_details.append(f"Conflict on '{key}': Values were {sorted_values}")
-    details_str = "\n    - ".join(conflict_details)
-    logger.warning(f"{file_path}\n    - {details_str}")
+def log_conflict(logger: logging.Logger, file_path: str, conflicts: Dict[str, List[str]]):
+    """Formats and logs a merge conflict message with messages grouped by field."""
+
+    conflict_lines = []
+    # Iterate through each field that has conflicts.
+    for field, messages in conflicts.items():
+        # Add a line for the field itself.
+        conflict_lines.append(f"Field '{field}':")
+        # Add an indented line for each specific error message for that field.
+        for message in messages:
+            conflict_lines.append(f"  - {message}")
+
+    # Join all lines, ensuring proper indentation for the whole block.
+    details_str = "\n    ".join(conflict_lines)
+    logger.warning(f"{file_path}\n    {details_str}")
 
 
 def process_export_batch(
