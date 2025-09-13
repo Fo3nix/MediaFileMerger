@@ -12,7 +12,7 @@ class MergeContext:
     def __init__(self, sources: List[models.Metadata]):
         self.sources: List[models.Metadata] = sources
         self.merged_data: Dict[str, Any] = {}
-        self.conflicts: Dict[str, Set[Any]] = {}
+        self.conflicts: Dict[str, List[str]] = {}
         self.finalized_fields: Set[str] = set()
 
     def get_value(self, field_name: str, required: bool = False) -> Any:
@@ -32,9 +32,11 @@ class MergeContext:
             self.merged_data[field_name] = value
             self.finalized_fields.add(field_name)
 
-    def record_conflict(self, field_name: str, values: Set[Any]):
+    def record_conflict(self, field_name: str, message: str):
         """Records a conflict for a specific field."""
-        self.conflicts[field_name] = values
+        if field_name not in self.conflicts:
+            self.conflicts[field_name] = []
+        self.conflicts[field_name].append(message)
 
 class MergeStep(abc.ABC):
     """Abstract base class for a single step in the merge pipeline."""
@@ -63,9 +65,7 @@ class BasicFieldMergeStep(MergeStep):
         if len(potential_values) == 1:
             context.set_value(self.field_name, potential_values.pop())
         else:
-            # More advanced conflict detection using your rules
-            # For simplicity here, we assume any multiple distinct values are a conflict
-            context.record_conflict(self.field_name, potential_values)
+            context.record_conflict(self.field_name, f"Conflicting values: {sorted(list(potential_values))}")
 
 
 class GPSMergeStep(MergeStep):
@@ -88,7 +88,10 @@ class GPSMergeStep(MergeStep):
                     conflicting_values.add(val)
 
             if len(conflicting_values) > 1:
-                context.record_conflict(field, conflicting_values)
+                all_values = {reference_val} | conflicting_values
+                msg = (f"GPS coordinates from different sources are not close enough to be considered the same. "
+                       f"Found values: {sorted(list(all_values))}")
+                context.record_conflict(field, msg)
             else:
                 context.set_value(field, reference_val)
 
@@ -164,7 +167,9 @@ class DateTimeAndZoneMergeStep(BasicFieldMergeStep):
         # Multiple distinct naive values
         if not inferred_tz or len(unique_naive_values) != 2:
             # Conflict if no GPS to help, or if more than 2 distinct times to compare
-            context.record_conflict(self.field_name, set(unique_naive_values))
+            msg = (f"Found multiple distinct naive times {sorted(unique_naive_values)}, "
+                   "but cannot resolve them without GPS data or because there are more than two distinct values.")
+            context.record_conflict(self.field_name, msg)
             return
 
         # --- IMPLEMENTING YOUR HEURISTIC for exactly two differing naive times ---
@@ -188,14 +193,18 @@ class DateTimeAndZoneMergeStep(BasicFieldMergeStep):
             context.set_value(self.field_name, final_value)
         else:
             # The difference cannot be explained by the timezone offset
-            context.record_conflict(self.field_name, set(unique_naive_values))
+            msg = (f"The difference between naive times '{t1}' and '{t2}' "
+                   f"cannot be explained by the inferred timezone offset ({offset}).")
+            context.record_conflict(self.field_name, msg)
 
     def _process_with_aware(self, context: MergeContext, aware_values: list[datetime], naive_values: list[datetime],
                             inferred_tz: ZoneInfo | None):
         # 3a. UTC Consistency Check
         utc_times = {v.astimezone(timezone.utc) for v in aware_values}
         if len(utc_times) > 1:
-            context.record_conflict(self.field_name, set(aware_values))
+            sorted_utc_times = sorted([dt.isoformat() for dt in utc_times])
+            msg = f"Timezone-aware datetimes do not agree on the absolute UTC time. Found values: {sorted_utc_times}"
+            context.record_conflict(self.field_name, msg)
             return
 
         final_utc_time = utc_times.pop()
@@ -209,7 +218,10 @@ class DateTimeAndZoneMergeStep(BasicFieldMergeStep):
             unique_offsets = {v.utcoffset() for v in aware_values}
             if len(unique_offsets) > 1:
                 # Without GPS, we cannot resolve the "Germany vs Russia" problem. Conflict.
-                context.record_conflict(self.field_name, set(aware_values))
+                sorted_aware_values = sorted([dt.isoformat() for dt in aware_values])
+                msg = (f"Aware datetimes have different offsets, but no GPS data is available to determine the "
+                       f"correct local time. Found values: {sorted_aware_values}")
+                context.record_conflict(self.field_name, msg)
                 return
             final_value = aware_values[0]  # All have same offset, so just use one
 
@@ -217,18 +229,13 @@ class DateTimeAndZoneMergeStep(BasicFieldMergeStep):
 
         # 3d. Validate Naive Values
         if naive_values:
-            conflicting_naives = set()
             for nv in set(naive_values):
-                # A naive value must match the final local time representation exactly.
                 if (nv.year, nv.month, nv.day, nv.hour, nv.minute, nv.second) != \
                         (final_value.year, final_value.month, final_value.day,
                          final_value.hour, final_value.minute, final_value.second):
-                    conflicting_naives.add(nv)
-
-            if conflicting_naives:
-                context.record_conflict(self.field_name, conflicting_naives)
-
-
+                    msg = (f"Naive time '{nv}' does not match the local time of the final, "
+                           f"consistent aware time '{final_value.strftime('%Y-%m-%d %H:%M:%S')}'")
+                    context.record_conflict(self.field_name, msg)
 
 
 # --- The Pipeline Orchestrator ---
