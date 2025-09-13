@@ -243,39 +243,6 @@ class PhotoProcessor:
         """Initializes the PhotoProcessor and its tools."""
         self.tf = TimezoneFinder()
 
-    def _process_datetime(self, dt_obj: datetime, lat: float, lon: float) -> datetime | None:
-        """
-        Takes a datetime object and ensures it is aware and in the correct
-        local timezone based on coordinates.
-
-        - If the object is naive, it is localized to the target timezone.
-        - If the object is already aware (e.g., in UTC), it is converted to the target timezone.
-        """
-
-        if not dt_obj:
-            return None
-
-        if lat is None or lon is None:
-            return dt_obj
-
-        # Find the target timezone name from the coordinates
-        tz_name = self.tf.timezone_at(lng=lon, lat=lat)
-        if not tz_name:
-            return dt_obj  # Return original if no timezone is found
-
-        target_tz = ZoneInfo(tz_name)
-
-        if dt_obj.tzinfo is None:
-            # The datetime is NAIVE. Stamp it with the local timezone.
-            return dt_obj.replace(tzinfo=target_tz)
-        else:
-            # check if there are differences in offsets (if dt_obj.utcoffset() is not None and not UTC)
-            if dt_obj.utcoffset() not in (None, timezone.utc.utcoffset(None)) and dt_obj.utcoffset() != target_tz.utcoffset(dt_obj):
-                print(f"Warning: Timezone offset mismatch. Original: {dt_obj.tzinfo}, Target: {target_tz}")
-
-            # The datetime is AWARE. Convert it to the local timezone.
-            return dt_obj.astimezone(target_tz)
-
     def _get_exiftool_batch_dict(self, filepaths: list[str]) -> list[dict]:
         """
         Extracts metadata from a BATCH of files using a single exiftool call.
@@ -393,9 +360,6 @@ class PhotoProcessor:
             gps_latitude = None
             gps_longitude = None
 
-        date_taken = self._process_datetime(date_taken, gps_latitude, gps_longitude)
-        date_modified = self._process_datetime(date_modified, gps_latitude, gps_longitude)
-
         return {
             "date_taken": date_taken,
             "date_taken_key": date_taken_key,
@@ -426,11 +390,8 @@ class PhotoProcessor:
         # Create a timezone-aware datetime object in UTC
         utc_date = datetime.fromtimestamp(int(creation_time), tz=timezone.utc) if creation_time else None
 
-        # Now, use the helper to convert the UTC date to the photo's local timezone
-        local_date = self._process_datetime(utc_date, latitude, longitude)
-
         return {
-            "date_taken": local_date,
+            "date_taken": utc_date,
             "gps_latitude": latitude,
             "gps_longitude": longitude,
         }

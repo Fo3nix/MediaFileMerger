@@ -12,7 +12,8 @@ from tqdm import tqdm
 from sqlalchemy.orm import Session, selectinload
 from photoprocessor.database import engine, SessionLocal
 from photoprocessor import models
-from photoprocessor.merge_rules import rules
+from photoprocessor.merger import MergeStep, GPSMergeStep, MergeContext, BasicFieldMergeStep, MergePipeline, \
+    DateTimeAndZoneMergeStep
 
 # --- Configuration ---
 CONFIG = {
@@ -52,40 +53,6 @@ def get_locations_by_paths(db: Session, paths: List[str]) -> List[models.Locatio
     ).options(
         selectinload(models.Location.media_file).selectinload(models.MediaFile.metadata_sources)
     ).all()
-
-
-def merge_metadata_for_export(main_source: models.Metadata, metadata_sources: List[models.Metadata]) -> Tuple[
-    Dict, Dict]:
-    """Merges multiple metadata sources into a single dictionary for export."""
-
-    def source_as_dict(source: models.Metadata) -> Dict[str, Any]:
-        if not source:
-            return {}
-        return {
-            "date_taken": source.date_taken,
-            "date_modified": source.date_modified,
-            "gps_latitude": source.gps_latitude,
-            "gps_longitude": source.gps_longitude,
-        }
-
-    main_dict = source_as_dict(main_source)
-    if not metadata_sources:
-        return main_dict, {}
-
-    merged = main_dict.copy()
-    conflicts = {}
-    for source in metadata_sources:
-        src_dict = source_as_dict(source)
-        for key, value in src_dict.items():
-            if value is None:
-                continue
-            if key not in merged or merged[key] is None:
-                merged[key] = value
-            elif not rules.compare(key, merged[key], value):
-                if key not in conflicts:
-                    conflicts[key] = {merged[key]}
-                conflicts[key].add(value)
-    return merged, conflicts
 
 
 def _generate_exiftool_args_for_file(metadata: Dict[str, Any]) -> List[str]:
@@ -195,7 +162,8 @@ def process_export_batch(
         export_dir: str,
         executor: ThreadPoolExecutor,
         logger: logging.Logger,
-        conflict_fp  # File pointer for writing conflict paths
+        conflict_fp,  # File pointer for writing conflict paths
+        pipeline: MergePipeline
 ) -> Dict[str, Any]:
     """Processes a single batch of files: merge, parallel copy, and batch metadata write."""
     stats = {"exported": 0, "skipped": 0, "conflicts": 0}
@@ -207,17 +175,23 @@ def process_export_batch(
         if os.path.exists(output_path):
             stats["skipped"] += 1
             continue
-        main_source = loc.media_file.metadata_sources[0] if loc.media_file.metadata_sources else None
-        other_sources = loc.media_file.metadata_sources[1:]
-        merged_meta, conflicts = merge_metadata_for_export(main_source, other_sources)
-        if conflicts:
+
+        # Run the pipeline
+        metadata_sources = loc.media_file.metadata_sources
+        if not metadata_sources:
+            continue  # Or handle as needed
+
+        result_context = pipeline.run(metadata_sources)
+
+        if result_context.conflicts:
             stats["conflicts"] += 1
-            log_conflict(logger, loc.path, conflicts)
-            conflict_fp.write(f"{loc.path}\n")  # Write conflicting path to file
-            conflict_fp.flush()  # Explicitly flush buffer to disk
+            log_conflict(logger, loc.path, result_context.conflicts)
+            conflict_fp.write(f"{loc.path}\n")
+            conflict_fp.flush()
             continue
+
         files_to_copy.append((loc.path, output_path))
-        files_for_metadata.append((output_path, merged_meta))
+        files_for_metadata.append((output_path, result_context.merged_data))
 
     if files_to_copy:
         copy_results = executor.map(copy_file_task, files_to_copy)
@@ -265,6 +239,15 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
 
     total_stats = {"exported": 0, "skipped": 0, "conflicts": 0}
 
+
+    export_merge_pipeline = MergePipeline(steps=[
+        GPSMergeStep(),
+        DateTimeAndZoneMergeStep("date_taken"),
+        DateTimeAndZoneMergeStep("date_modified"),
+    ])
+
+
+
     try:
         with SessionLocal() as db, ThreadPoolExecutor(max_workers=CONFIG["MAX_COPY_WORKERS"]) as executor, \
                 open(conflict_paths_file, 'w', encoding='utf-8') as conflict_fp:
@@ -295,7 +278,7 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
                 for i in range(0, total_files, CONFIG["BATCH_SIZE"]):
                     batch = locations_to_export[i:i + CONFIG["BATCH_SIZE"]]
                     batch_size_bytes = sum(loc.media_file.file_size for loc in batch)
-                    stats = process_export_batch(batch, export_dir, executor, conflict_logger, conflict_fp)
+                    stats = process_export_batch(batch, export_dir, executor, conflict_logger, conflict_fp, export_merge_pipeline)
                     for key in total_stats:
                         total_stats[key] += stats[key]
                     pbar.update(batch_size_bytes)
