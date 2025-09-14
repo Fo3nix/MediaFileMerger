@@ -164,6 +164,7 @@ def log_conflict(logger: logging.Logger, file_path: str, conflicts: Dict[str, Li
 def process_export_batch(
         batch_locations: List[models.Location],
         export_dir: str,
+        conflict_dir: str,
         executor: ThreadPoolExecutor,
         logger: logging.Logger,
         conflict_fp,  # File pointer for writing conflict paths
@@ -172,6 +173,7 @@ def process_export_batch(
     """Processes a single batch of files: merge, parallel copy, and batch metadata write."""
     stats = {"exported": 0, "skipped": 0, "conflicts": 0}
     files_to_copy = []
+    files_to_copy_conflict = []
     files_for_metadata = []
 
     for loc in batch_locations:
@@ -192,6 +194,9 @@ def process_export_batch(
             log_conflict(logger, loc.path, result_context.conflicts)
             conflict_fp.write(f"{loc.path}\n")
             conflict_fp.flush()
+            conflict_output_path = os.path.join(conflict_dir, loc.filename)
+            if not os.path.exists(conflict_output_path):
+                files_to_copy_conflict.append((loc.path, conflict_output_path))
             continue
 
         files_to_copy.append((loc.path, output_path))
@@ -204,6 +209,13 @@ def process_export_batch(
                 print(f"\nError copying {src}: {error}")
             else:
                 stats["exported"] += 1
+
+    if files_to_copy_conflict:
+        # We just need to execute the copy, we already counted the conflicts
+        for src, error in executor.map(copy_file_task, files_to_copy_conflict):
+            if error:
+                print(f"\nError copying conflicted file {src}: {error}")
+
     if files_for_metadata:
         try:
             write_metadata_batch(files_for_metadata)
@@ -222,6 +234,9 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
 
     print("Initializing...")
     os.makedirs(export_dir, exist_ok=True)
+
+    conflict_dir = os.path.join(export_dir, "conflicted_files_for_review")
+    os.makedirs(conflict_dir, exist_ok=True)
 
     conflict_log_path = os.path.join(export_dir, 'export_conflicts.log')
     conflict_paths_file = os.path.join(export_dir, 'export_conflicts_paths.txt')
@@ -282,7 +297,7 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
                 for i in range(0, total_files, CONFIG["BATCH_SIZE"]):
                     batch = locations_to_export[i:i + CONFIG["BATCH_SIZE"]]
                     batch_size_bytes = sum(loc.media_file.file_size for loc in batch)
-                    stats = process_export_batch(batch, export_dir, executor, conflict_logger, conflict_fp, export_merge_pipeline)
+                    stats = process_export_batch(batch, export_dir, conflict_dir, executor, conflict_logger, conflict_fp, export_merge_pipeline)
                     for key in total_stats:
                         total_stats[key] += stats[key]
                     pbar.update(batch_size_bytes)
@@ -293,7 +308,7 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
         print(f"✅ Successfully exported {total_stats['exported']} new files.")
         print(f"⏩ Skipped {total_stats['skipped']} files that already existed in the destination.")
         if total_stats['conflicts'] > 0:
-            print(f"⚠️ Encountered {total_stats['conflicts']} merge conflicts. These files were NOT exported.")
+            print(f"⚠️ Encountered {total_stats['conflicts']} merge conflicts. These files were copied WITHOUT metadata to the '{os.path.basename(conflict_dir)}' subfolder for manual review.")
             print(f"   See the full list of conflicts in the log file: {conflict_log_path}")
             print(f"   A list of conflicted file paths has been saved to: {conflict_paths_file}")
         print("-----------------------")
