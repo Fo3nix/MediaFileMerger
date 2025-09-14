@@ -118,7 +118,7 @@ def save_batch_to_db(db: Session, owner: models.Owner, batch_data: Dict) -> (Dic
     return stats, failures
 
 
-def main(owner_name: str, takeout_dir: str):
+def main(owner_name: str, takeout_dir: str = None, filelist_path: str = None):
     print("Initializing...")
     models.Base.metadata.create_all(bind=engine)
 
@@ -127,7 +127,18 @@ def main(owner_name: str, takeout_dir: str):
     logging.basicConfig(level=logging.ERROR, filename=failure_log_path, filemode='w',
                         format='%(asctime)s - %(message)s')
 
-    all_paths = scan_media_files(takeout_dir)
+    all_paths = []
+    if filelist_path:
+        print(f"Reading file list from: {filelist_path}")
+        try:
+            with open(filelist_path, 'r', encoding='utf-8') as f:
+                all_paths = [line.strip() for line in f if line.strip()]
+        except FileNotFoundError:
+            print(f"❌ ERROR: Input file not found at '{filelist_path}'")
+            return
+    elif takeout_dir:
+        all_paths = scan_media_files(takeout_dir)
+
     total_files = len(all_paths)
     if not total_files:
         print("No media files found.");
@@ -187,6 +198,14 @@ def main(owner_name: str, takeout_dir: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Import media files into the PhotoProcessor database.")
     parser.add_argument("owner_name", type=str, help="The name of the owner of these media files.")
-    parser.add_argument("takeout_dir", type=str, help="The input directory for the import.")
+
+    # Create a group for mutually exclusive arguments
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--directory", "-d", type=str, help="The input directory to scan for media.")
+    source_group.add_argument("--filelist", "-f", type=str,
+                              help="Path to a text file with one file path per line to import.")
+
     args = parser.parse_args()
-    main(args.owner_name, args.takeout_dir)
+
+    # Call main with the new arguments
+    main(args.owner_name, takeout_dir=args.directory, filelist_path=args.filelist)
