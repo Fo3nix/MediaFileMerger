@@ -16,6 +16,9 @@ import hashlib
 from PIL import Image
 import re
 
+from pillow_heif import register_heif_opener
+register_heif_opener()
+
 @lru_cache(maxsize=256)
 def get_directory_contents(directory_path: str) -> set:
     """
@@ -32,6 +35,15 @@ def _validate_gps(lat, lon) -> bool:
     """Validates GPS coordinates."""
     if lat is None or lon is None:
         return False
+
+    try:
+        # Attempt to convert to float, in case they are strings
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except (ValueError, TypeError):
+        # If conversion fails, the coordinates are invalid
+        return False
+
     if abs(lat) < 1e-6 and abs(lon) < 1e-6:
         return False
     if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
