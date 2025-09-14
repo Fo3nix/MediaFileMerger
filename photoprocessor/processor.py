@@ -364,8 +364,8 @@ class PhotoProcessor:
         date_modified = self._to_datetime(date_str, default_timezone=default_timezone)
         date_modified_key = str(chosen_key)
 
-        gps_latitude = self._get_optional(raw_exif, ["EXIF:GPSLatitude", "Composite:GPSLatitude"])
-        gps_longitude = self._get_optional(raw_exif, ["EXIF:GPSLongitude", "Composite:GPSLongitude"])
+        gps_latitude = self._get_optional(raw_exif, ["Composite:GPSLatitude"])
+        gps_longitude = self._get_optional(raw_exif, ["Composite:GPSLongitude"])
 
         # validate gps
         if not _validate_gps(gps_latitude, gps_longitude):
