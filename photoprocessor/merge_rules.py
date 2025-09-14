@@ -19,8 +19,8 @@ class MergeRules:
         return rule(value1, value2)
 
 # check if two GPS coordinates are "close enough"
-# A tolerance of 1e-4 is about 11 meters, which is very reasonable for consumer GPS.
-def gps_comparator(val1: float, val2: float, tolerance: float = 1e-4) -> bool:
+# A tolerance of 4e-4 is about 44 meters, which is very reasonable for consumer GPS.
+def gps_comparator(val1: float, val2: float, tolerance: float = 4e-4) -> bool:
     """Returns True if the absolute difference is within the tolerance."""
     return math.isclose(val1, val2, abs_tol=tolerance)
 
