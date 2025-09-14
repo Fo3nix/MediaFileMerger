@@ -253,17 +253,17 @@ class DateTimeAndZoneMergeStep(BasicFieldMergeStep):
                 return
 
         final_utc_time = min(utc_groups.keys())
+        final_value = None
 
         # Group naive sources by their datetime value to find unique times
         unique_naive_groups = {}
         for s in naive_sources:
             unique_naive_groups.setdefault(getattr(s, self.field_name), []).append(s.id)
 
-        final_value = None
 
         # Case 1: Resolve using a single unique naive time as the local time reference.
         # This handles your scenario where aware + naive times can determine the offset.
-        if len(unique_naive_groups) == 1:
+        if final_value is None and len(unique_naive_groups) == 1:
             unique_naive_time = list(unique_naive_groups.keys())[0]
             offset = unique_naive_time - final_utc_time.replace(tzinfo=None)
 
@@ -285,14 +285,30 @@ class DateTimeAndZoneMergeStep(BasicFieldMergeStep):
             else:
                 # No GPS. Check if original aware sources had a consistent offset.
                 unique_offsets = {getattr(s, self.field_name).utcoffset() for s in aware_sources}
-                if len(unique_offsets) > 1:
+                if len(unique_offsets) == 1:
+                    # All aware times have the same offset, so it's safe to use that zone.
+                    final_value = final_utc_time.astimezone(getattr(aware_sources[0], self.field_name).tzinfo)
+                elif len(unique_offsets) == 2:
+                    # if one of the offsets is zero (UTC), we can still use the other offset
+                    # so check for that case (that one has timedelta of 0, the other does not)
+                    if None in unique_offsets:
+                        unique_offsets.remove(None)
+                    if timedelta(0) in unique_offsets:
+                        unique_offsets.remove(timedelta(0))
+                    if len(unique_offsets) == 1:
+                        final_value = final_utc_time.astimezone(timezone(unique_offsets.pop()))
+                    else:
+                        offsets_repr = sorted([o for o in unique_offsets if o is not None])
+                        msg = (f"Aware datetimes have conflicting offsets ({offsets_repr}), and no GPS or unique naive "
+                               f"time is available to determine the correct local timezone.")
+                        context.record_conflict(self.field_name, msg)
+                        return
+                elif len(unique_offsets) > 2:
                     offsets_repr = sorted([o for o in unique_offsets if o is not None])
                     msg = (f"Aware datetimes have conflicting offsets ({offsets_repr}), and no GPS or unique naive "
                            f"time is available to determine the correct local timezone.")
                     context.record_conflict(self.field_name, msg)
                     return
-                # All original aware times have the same offset, so it's safe to use that zone.
-                final_value = final_utc_time.astimezone(getattr(aware_sources[0], self.field_name).tzinfo)
 
         context.set_value(self.field_name, final_value)
 
