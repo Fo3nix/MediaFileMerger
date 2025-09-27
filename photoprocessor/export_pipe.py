@@ -216,7 +216,8 @@ def process_export_batch(
         executor: ThreadPoolExecutor,
         logger: logging.Logger,
         conflict_fp,  # File pointer for writing conflict paths
-        pipeline: MergePipeline
+        pipeline: MergePipeline,
+        processed_media_ids: set
 ) -> Dict[str, Any]:
     """Processes a single batch of files: merge, parallel copy, and batch metadata write."""
     stats = {"exported": 0, "skipped": 0, "conflicts": 0}
@@ -225,8 +226,14 @@ def process_export_batch(
     files_for_metadata = []
 
     for loc in batch_locations:
+        if loc.media_file.id in processed_media_ids:
+            stats["skipped"] += 1
+            continue
+
         metadata_sources = loc.media_file.metadata_sources
         if not metadata_sources:
+            stats["skipped"] += 1
+            print("Skipped file with no metadata sources:", loc.path)
             continue
         result_context = pipeline.run(metadata_sources)
 
@@ -252,6 +259,7 @@ def process_export_batch(
 
         files_to_copy.append((loc.path, output_path))
         files_for_metadata.append((output_path, result_context.merged_data))
+        processed_media_ids.add(loc.media_file.id)
 
     if files_to_copy:
         copy_results = executor.map(copy_file_task, files_to_copy)
@@ -308,6 +316,7 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
     conflict_logger.addHandler(fh)
 
     total_stats = {"exported": 0, "skipped": 0, "conflicts": 0}
+    processed_media_ids = set()
 
 
     export_merge_pipeline = MergePipeline(steps=[
@@ -348,7 +357,7 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
                 for i in range(0, total_files, CONFIG["BATCH_SIZE"]):
                     batch = locations_to_export[i:i + CONFIG["BATCH_SIZE"]]
                     batch_size_bytes = sum(loc.media_file.file_size for loc in batch)
-                    stats = process_export_batch(batch, export_dir, conflict_dir, executor, conflict_logger, conflict_fp, export_merge_pipeline)
+                    stats = process_export_batch(batch, export_dir, conflict_dir, executor, conflict_logger, conflict_fp, export_merge_pipeline, processed_media_ids)
                     for key in total_stats:
                         total_stats[key] += stats[key]
                     pbar.update(batch_size_bytes)
