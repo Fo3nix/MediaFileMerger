@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor
 import sys
+import re
 
 from tqdm import tqdm
 from sqlalchemy.orm import Session, selectinload
@@ -39,8 +40,10 @@ def get_locations_for_owner(db: Session, owner: models.Owner) -> List[models.Loc
     ownership_records = db.query(models.MediaOwnership).filter(
         models.MediaOwnership.owner_id == owner.id
     ).options(
-        selectinload(models.MediaOwnership.location).selectinload(models.Location.media_file).selectinload(
-            models.MediaFile.metadata_sources)
+        selectinload(models.MediaOwnership.location).selectinload(models.Location.media_file).options(
+            selectinload(models.MediaFile.metadata_sources),
+            selectinload(models.MediaFile.locations)
+        )
     ).all()
     return [record.location for record in ownership_records]
 
@@ -51,7 +54,10 @@ def get_locations_by_paths(db: Session, paths: List[str]) -> List[models.Locatio
     return db.query(models.Location).filter(
         models.Location.path.in_(paths)
     ).options(
-        selectinload(models.Location.media_file).selectinload(models.MediaFile.metadata_sources)
+        selectinload(models.Location.media_file).options(
+            selectinload(models.MediaFile.metadata_sources),
+            selectinload(models.MediaFile.locations)
+        )
     ).all()
 
 
@@ -161,6 +167,48 @@ def log_conflict(logger: logging.Logger, file_path: str, conflicts: Dict[str, Li
     logger.warning(f"{file_path}\n    {details_str}")
 
 
+def generate_relative_export_path(media_file: models.MediaFile, merged_metadata: Dict[str, Any]) -> str:
+    """
+    Generates the full relative export path for a media file based on a prioritized
+    set of rules, falling back to a year-based structure using the merged metadata.
+    """
+    filename = media_file.locations[0].filename
+
+    # --- DEFINE YOUR FOLDER HIERARCHY HERE ---
+    priority_rules = [
+        # (pattern_to_find_in_path, target_export_subdirectory)
+        ('whatsapp images/sent', os.path.join("Whatsapp Images", "Sent")),
+        ('whatsapp video/sent', os.path.join("Whatsapp Video", "Sent")),
+        ('whatsapp images', "Whatsapp Images"),
+        ('whatsapp video', "Whatsapp Video"),
+        ('dcim/camera', "Camera"),
+        ('screenshots', "Screenshots"),
+    ]
+
+    all_paths = [loc.path.lower().replace('\\', '/') for loc in media_file.locations]
+
+    # 1. Check paths against priority rules
+    for pattern, target_subdir in priority_rules:
+        for path in all_paths:
+            if pattern in path:
+                return os.path.join(target_subdir, filename)  # Return full relative path
+
+    # 2. Check filename pattern as a fallback rule for WhatsApp
+    if re.search(r'-WA\d{4}', filename, re.IGNORECASE):
+        if media_file.mime_type.startswith('video/'):
+            return os.path.join("Whatsapp Video", filename)
+        else:
+            return os.path.join("Whatsapp Images", filename)
+
+    # --- 3. Default to Year-Based Pathing using Merged Date ---
+    date_taken = merged_metadata.get("date_taken")
+    if date_taken and isinstance(date_taken, datetime):
+        year_str = str(date_taken.year)
+        return os.path.join(year_str, filename)
+
+    # 4. Final fallback for files with no usable date information
+    return os.path.join("Unknown_Date", filename)
+
 def process_export_batch(
         batch_locations: List[models.Location],
         export_dir: str,
@@ -177,16 +225,9 @@ def process_export_batch(
     files_for_metadata = []
 
     for loc in batch_locations:
-        output_path = os.path.join(export_dir, loc.filename)
-        if os.path.exists(output_path):
-            stats["skipped"] += 1
-            continue
-
-        # Run the pipeline
         metadata_sources = loc.media_file.metadata_sources
         if not metadata_sources:
-            continue  # Or handle as needed
-
+            continue
         result_context = pipeline.run(metadata_sources)
 
         if result_context.conflicts:
@@ -197,6 +238,16 @@ def process_export_batch(
             conflict_output_path = os.path.join(conflict_dir, loc.filename)
             if not os.path.exists(conflict_output_path):
                 files_to_copy_conflict.append((loc.path, conflict_output_path))
+            continue
+
+        relative_path = generate_relative_export_path(loc.media_file, result_context.merged_data)
+        output_path = os.path.join(export_dir, relative_path)
+
+        output_dir_for_file = os.path.dirname(output_path)
+        os.makedirs(output_dir_for_file, exist_ok=True)
+
+        if os.path.exists(output_path):
+            stats["skipped"] += 1
             continue
 
         files_to_copy.append((loc.path, output_path))
