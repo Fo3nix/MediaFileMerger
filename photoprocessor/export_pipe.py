@@ -339,7 +339,7 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
                       unit_divisor=1024) as pbar:
                 for i in range(0, total_files, CONFIG["BATCH_SIZE"]):
                     batch = locations_to_export[i:i + CONFIG["BATCH_SIZE"]]
-                    batch_size_bytes = sum(loc.media_file.file_size for loc in batch)
+                    batch_size_bytes = sum(loc.file_size for loc in batch)
                     stats = process_export_batch(batch, export_dir, conflict_dir, executor, conflict_logger, conflict_fp, export_merge_pipeline, processed_media_ids)
                     for key in total_stats:
                         total_stats[key] += stats[key]

@@ -445,7 +445,7 @@ class DateTimeAndZoneMergeStep(MergeStep):
                 value = gps_datetime.astimezone(inferred_tz) if inferred_tz else gps_datetime
 
         if value:
-            export_arg = DateTimeArgument(value, "taken")
+            export_arg = DateTimeArgument(value, self.date_type)
             context.set_value(self.date_type, export_arg)
 
     def _process_only_naive(self, context: MergeContext, naive_sources: list[models.MetadataEntry],
