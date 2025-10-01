@@ -3,6 +3,7 @@ from sqlalchemy.orm import relationship
 from photoprocessor.database import Base  # Import Base from your database module
 from sqlalchemy.types import TypeDecorator
 import datetime
+from itertools import chain
 
 
 ## CUSTOM TYPES
@@ -88,6 +89,7 @@ class Location(Base):
     id = Column(Integer, primary_key=True, index=True)
     path = Column(String, nullable=False, unique=True, index=True)
     filename = Column(String, nullable=False)
+    file_size = Column(Integer, nullable=False)
 
     # A location is an instance of ONE media file's content
     media_file_id = Column(Integer, ForeignKey('media_files.id'), nullable=False)
@@ -97,7 +99,7 @@ class Location(Base):
     owners = relationship("MediaOwnership", back_populates="location")
 
     # A location can have multiple metadata entries from different sources
-    metadata_entries = relationship("Metadata", back_populates="location", cascade="all, delete-orphan")
+    metadata_sources = relationship("MetadataSource", back_populates="location", cascade="all, delete-orphan")
 
 
 class MediaFile(Base):
@@ -108,13 +110,20 @@ class MediaFile(Base):
     id = Column(Integer, primary_key=True, index=True)
     file_hash = Column(String, nullable=False, index=True, unique=True)
     mime_type = Column(String, nullable=False)
-    file_size = Column(Integer, nullable=False)
 
     # A single media file (hash) can exist at multiple locations
     locations = relationship("Location", back_populates="media_file", cascade="all, delete-orphan")
 
-    # A single media file can have multiple sources of metadata
-    metadata_sources = relationship("Metadata", back_populates="media_file", cascade="all, delete-orphan")
+    @property
+    def all_metadata_sources(self) -> list['MetadataEntry']:
+        """
+        Returns a flat list of all MetadataEntry objects associated with this
+        media file from across all its locations and sources.
+        """
+        # This uses a generator expression for memory efficiency
+        return list(chain.from_iterable(
+            loc.metadata_sources for loc in self.locations
+        ))
 
 
 class MediaOwnership(Base):
@@ -134,28 +143,36 @@ class MediaOwnership(Base):
     location = relationship("Location", back_populates="owners")
 
 
-class Metadata(Base):
-    __tablename__ = 'metadata'
-    # __table_args__ = (
-    #     # A media file can only have one metadata entry per source (e.g., one 'exif').
-    #     UniqueConstraint('media_file_id', 'source', name='uq_media_file_source'),
-    # )
+class MetadataSource(Base):
+    """Stores the raw metadata blob from a single source (e.g., one exiftool run)."""
+    __tablename__ = 'metadata_sources'
+    __table_args__ = (
+        UniqueConstraint('location_id', 'source', name='uq_location_source'),
+    )
     id = Column(Integer, primary_key=True)
-    media_file_id = Column(Integer, ForeignKey('media_files.id'), nullable=False, index=True)
     location_id = Column(Integer, ForeignKey('locations.id'), nullable=False, index=True)
-
     source = Column(String, nullable=False)  # e.g., 'exif', 'google_json'
-
-    # Key parsed fields for quick access and merging
-    date_taken = Column(FlexibleDateTime)
-    date_taken_key = Column(String) # e.g. "EXIF:DateTimeOriginal"
-    date_modified = Column(FlexibleDateTime)
-    date_modified_key = Column(String)
-    gps_latitude = Column(REAL)
-    gps_longitude = Column(REAL)
-
-    # The complete raw data from the source
     raw_data = Column(JSON, nullable=False)
 
-    media_file = relationship("MediaFile", back_populates="metadata_sources")
-    location = relationship("Location", back_populates="metadata_entries")
+    location = relationship("Location")
+    # A single source blob can contain many individual metadata entries
+    entries = relationship("MetadataEntry", back_populates="source_info", cascade="all, delete-orphan")
+
+
+class MetadataEntry(Base):
+    """An EAV model for storing individual metadata points, linked to a raw source blob."""
+    __tablename__ = 'metadata_entries'
+    __table_args__ = (
+        UniqueConstraint('source_id', 'key', name='uq_source_key'),
+    )
+    id = Column(Integer, primary_key=True)
+    # Replaces media_file_id and location_id for a cleaner link
+    source_id = Column(Integer, ForeignKey('metadata_sources.id'), nullable=False, index=True)
+
+    key = Column(String, nullable=False, index=True)
+
+    value_str = Column(String)
+    value_dt = Column(FlexibleDateTime)
+    value_real = Column(REAL)
+
+    source_info = relationship("MetadataSource", back_populates="entries")

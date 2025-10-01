@@ -289,7 +289,7 @@ class PhotoProcessor:
             # Return an empty list of the same size so the caller can map results.
             return [{} for _ in filepaths]
 
-    def _to_datetime(self, date_str: str, default_timezone: timezone) -> datetime | None:
+    def _to_datetime(self, date_str: str, default_timezone: timezone|None) -> datetime | None:
         """
         Safely converts a string to a datetime object.
         It returns a naive object, which will be made aware later if possible.
@@ -332,81 +332,113 @@ class PhotoProcessor:
                     return return_chosen(val, key)
         return return_chosen(None, None)
 
+    def _get_metadata_entries_from_dict(self, data_dict: dict, keys: list, type_name: str) -> list[dict]:
+        # type needs to be one of: str, real, dt
+        entries = []
+        for key in keys:
+            if key in data_dict:
+                value = data_dict[key]
+                entry = {"key": key}
+                if type_name == "str" and isinstance(value, str):
+                    entry["value_str"] = value
+                elif type_name == "real" and isinstance(value, (float, int)):
+                    entry["value_real"] = float(value)
+                elif type_name == "dt" and isinstance(value, str):
+                    dt_value = self._to_datetime(value, default_timezone=None)
+                    if dt_value:
+                        entry["value_dt"] = dt_value
+                    else:
+                        continue
+                else:
+                    continue
+                entries.append(entry)
+
+        return entries
+
     def _parse_key_exif_fields(self, raw_exif):
-        """Extracts just the key fields needed for the unified Metadata table."""
+        """Extracts key fields into a list of EAV dictionaries."""
         if not raw_exif:
-            return None
+            return []
 
-        date_str, chosen_key = self._get_optional(raw_exif, [
-            "XMP:DateTimeOriginal",
-            ("EXIF:DateTimeOriginal", "EXIF:OffsetTimeOriginal"),
-            "EXIF:DateTimeOriginal",
-            "QuickTime:CreationDate",
-            "QuickTime:CreateDate",
-            "Composite:GPSDateTime",
-            "Keys:CreationDate",
-            "UserData:DateTimeOriginal",
-            "XMP:CreateDate",
-            "EXIF:CreateDate",
-        ], return_chosen_key = True)
-        default_timezone = None
-        if chosen_key == "Composite:GPSDateTime" or chosen_key == "QuickTime:CreationDate" or chosen_key == "QuickTime:CreateDate":
-            default_timezone = timezone.utc
-        date_taken = self._to_datetime(date_str, default_timezone=default_timezone)
-        date_taken_key = str(chosen_key)
+        entries = []
 
-        date_str, chosen_key = self._get_optional(raw_exif, [
-            "XMP:ModifyDate",
-            "QuickTime:ModifyDate",
-            "EXIF:ModifyDate",
-        ], return_chosen_key = True)
-        default_timezone = timezone.utc if chosen_key == "QuickTime:ModifyDate" else None
-        date_modified = self._to_datetime(date_str, default_timezone=default_timezone)
-        date_modified_key = str(chosen_key)
+        source_file_path = raw_exif.get("SourceFile")
+        if source_file_path:
+            entries.append({
+                "key": "exiftool:SourceFile",
+                "value_str": os.path.basename(source_file_path)
+            })
 
-        gps_latitude = self._get_optional(raw_exif, ["Composite:GPSLatitude"])
-        gps_longitude = self._get_optional(raw_exif, ["Composite:GPSLongitude"])
+        # GET DATES
+        date_taken_entries = self._get_metadata_entries_from_dict(
+            raw_exif,
+            keys=[
+                "XMP:DateTimeOriginal",
+                "EXIF:DateTimeOriginal",
+                "QuickTime:CreationDate",
+                "QuickTime:CreateDate",
+                "Composite:GPSDateTime",
+                "Keys:CreationDate",
+                "UserData:DateTimeOriginal",
+                "XMP:CreateDate",
+                "EXIF:CreateDate",
+            ],
+            type_name="dt",
+        )
+        entries.extend(date_taken_entries)
 
-        # validate gps
-        if not _validate_gps(gps_latitude, gps_longitude):
-            gps_latitude = None
-            gps_longitude = None
+        date_offset_entries = self._get_metadata_entries_from_dict(
+            raw_exif,
+            keys=["EXIF:OffsetTimeOriginal"],
+            type_name="str"
+        )
+        entries.extend(date_offset_entries)
 
-        return {
-            "date_taken": date_taken,
-            "date_taken_key": date_taken_key,
-            "date_modified": date_modified,
-            "date_modified_key": date_modified_key,
-            "gps_latitude": gps_latitude,
-            "gps_longitude": gps_longitude,
-        }
+        date_modified_entries = self._get_metadata_entries_from_dict(
+            raw_exif,
+            keys=[
+                "XMP:ModifyDate",
+                "QuickTime:ModifyDate",
+                "EXIF:ModifyDate"
+            ],
+            type_name="dt",
+        )
+        entries.extend(date_modified_entries)
+
+        # GET GPS
+        gps_entries = self._get_metadata_entries_from_dict(
+            raw_exif,
+            keys=["Composite:GPSLatitude","Composite:GPSLongitude"],
+            type_name="real",
+        )
+        entries.extend(gps_entries)
+
+
+        return entries
 
     def _parse_key_google_fields(self, google_json):
-        """
-        Extracts key fields from Google JSON and converts the UTC timestamp
-        to the photo's local time.
-        """
+        """Extracts key fields from Google JSON into a list of EAV dictionaries."""
         if not google_json:
-            return None
+            return []
 
-        # First, extract the raw values
+        entries = []
         creation_time = google_json.get("photoTakenTime", {}).get("timestamp")
         latitude = google_json.get("geoData", {}).get("latitude")
         longitude = google_json.get("geoData", {}).get("longitude")
+        title = google_json.get("title")
 
-        # validate gps
-        if not _validate_gps(latitude, longitude):
-            latitude = None
-            longitude = None
+        if title:
+            entries.append({"key": "google:title", "value_str": title})
 
-        # Create a timezone-aware datetime object in UTC
-        utc_date = datetime.fromtimestamp(int(creation_time), tz=timezone.utc) if creation_time else None
+        if creation_time:
+            utc_date = datetime.fromtimestamp(int(creation_time), tz=timezone.utc)
+            entries.append({"key": "google:photoTakenTime", "value_dt": utc_date})
 
-        return {
-            "date_taken": utc_date,
-            "gps_latitude": latitude,
-            "gps_longitude": longitude,
-        }
+        if _validate_gps(latitude, longitude):
+            entries.append({"key": "google:geoDataLatitude", "value_real": latitude})
+            entries.append({"key": "google:geoDataLongitude", "value_real": longitude})
+
+        return entries
 
     def process_batch(self, filepaths: list[str]) -> tuple[dict, list]:
         """
@@ -481,6 +513,7 @@ class PhotoProcessor:
                         # Video hashing is a separate process, can be done directly
                         file_hash = _strict_video_hash(path)
                     else:
+                        print("Hashing file partially due to unknown MIME type.")
                         file_hash = _hash_file_partially(path)
 
                     if not file_hash:
@@ -490,10 +523,13 @@ class PhotoProcessor:
                     google_json_dict = data["google_json_dict"]
 
                     successes[path] = {
-                        "media_file": {
-                            "file_hash": file_hash, "mime_type": mime_type,
+                        "location_data": {
                             "file_size": raw_exif_dict.get("File:FileSize", 0) if raw_exif_dict else os.path.getsize(
-                                path),
+                                path)
+                        },
+                        "media_file": {
+                            "file_hash": file_hash,
+                            "mime_type": mime_type,
                         },
                         "exif_metadata": {"parsed": self._parse_key_exif_fields(raw_exif_dict),
                                           "raw": raw_exif_dict} if raw_exif_dict else None,

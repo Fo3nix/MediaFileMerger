@@ -13,6 +13,7 @@ from tqdm import tqdm
 from sqlalchemy.orm import Session, selectinload
 from photoprocessor.database import engine, SessionLocal
 from photoprocessor import models
+from photoprocessor.export_arguments import ExportArgument
 from photoprocessor.merger import MergeStep, GPSMergeStep, MergeContext, BasicFieldMergeStep, MergePipeline, \
     DateTimeAndZoneMergeStep
 
@@ -41,8 +42,9 @@ def get_locations_for_owner(db: Session, owner: models.Owner) -> List[models.Loc
         models.MediaOwnership.owner_id == owner.id
     ).options(
         selectinload(models.MediaOwnership.location).selectinload(models.Location.media_file).options(
-            selectinload(models.MediaFile.metadata_sources),
-            selectinload(models.MediaFile.locations)
+            # This is the full chain to load everything needed for the property
+            selectinload(models.MediaFile.locations).selectinload(models.Location.metadata_sources).selectinload(
+                models.MetadataSource.entries)
         )
     ).all()
     return [record.location for record in ownership_records]
@@ -55,83 +57,43 @@ def get_locations_by_paths(db: Session, paths: List[str]) -> List[models.Locatio
         models.Location.path.in_(paths)
     ).options(
         selectinload(models.Location.media_file).options(
-            selectinload(models.MediaFile.metadata_sources),
-            selectinload(models.MediaFile.locations)
+            # This is the full chain to load everything needed for the property
+            selectinload(models.MediaFile.locations).selectinload(models.Location.metadata_entries).selectinload(
+                models.MetadataSource.entries)
         )
     ).all()
 
 
-def _generate_exiftool_args_for_file(metadata: Dict[str, Any]) -> List[str]:
-    """Generates the list of ExifTool command-line args for a single file's metadata."""
+def _generate_exiftool_args_for_file(export_arguments: List[ExportArgument]) -> List[str]:
+    """
+    Generates the list of ExifTool command-line args for a single file's metadata
+    by calling the build() method on each ExportArgument object.
+    """
     args = []
-    tag_map = {"gps_latitude": "-GPSLatitude", "gps_longitude": "-GPSLongitude"}
-
-    # --- Date Taken ---
-    date_taken = metadata.get("date_taken")
-    if date_taken and isinstance(date_taken, datetime):
-        # Format for EXIF/File dates (local time, no offset)
-        local_time_str = date_taken.strftime('%Y:%m:%d %H:%M:%S')
-        args.extend([
-            f"-EXIF:DateTimeOriginal={local_time_str}",
-            f"-EXIF:CreateDate={local_time_str}",
-            f"-FileCreateDate={local_time_str}",
-        ])
-
-        # If the date is timezone-aware, write additional offset and UTC tags
-        if date_taken.tzinfo:
-            offset_str = date_taken.strftime('%z')
-            offset_str_formatted = f"{offset_str[:3]}:{offset_str[3:]}"
-            utc_date = date_taken.astimezone(timezone.utc)
-            utc_time_str = utc_date.strftime('%Y:%m:%d %H:%M:%S')
-
-            args.extend([
-                f"-EXIF:OffsetTimeOriginal={offset_str_formatted}",
-                f"-XMP:DateTimeOriginal={date_taken.isoformat()}",  # XMP uses full ISO 8601
-                f"-QuickTime:CreateDate={utc_time_str}",
-                f"-Keys:CreationDate={utc_time_str}",
-            ])
-
-    # --- Date Modified ---
-    date_modified = metadata.get("date_modified")
-    if date_modified and isinstance(date_modified, datetime):
-        local_mod_time_str = date_modified.strftime('%Y:%m:%d %H:%M:%S')
-        args.extend([
-            f"-EXIF:ModifyDate={local_mod_time_str}",
-            f"-FileModifyDate={local_mod_time_str}",
-        ])
-
-        # If the date is aware, write UTC and XMP tags
-        if date_modified.tzinfo:
-            utc_mod_date = date_modified.astimezone(timezone.utc)
-            utc_mod_time_str = utc_mod_date.strftime('%Y:%m:%d %H:%M:%S')
-            args.extend([
-                f"-XMP:ModifyDate={date_modified.isoformat()}",
-                f"-QuickTime:ModifyDate={utc_mod_time_str}",
-            ])
-
-    # --- GPS and other tags ---
-    for key, value in metadata.items():
-        if key in tag_map and value is not None:
-            args.append(f"{tag_map[key]}={value}")
+    for arg_object in export_arguments:
+        args.extend(arg_object.build())
     return args
 
 
-def write_metadata_batch(files_to_process: List[Tuple[str, Dict]]):
+def write_metadata_batch(files_to_process: List[Tuple[str, List[ExportArgument]]]):
     """Writes metadata to a batch of files using a single ExifTool command."""
     if not files_to_process:
         return
     base_args = [CONFIG["EXIFTOOL_PATH"], "-overwrite_original", "-common_args"]
     command_args = []
-    for output_path, merged_meta in files_to_process:
-        if not merged_meta:
+
+    for output_path, export_args in files_to_process:
+        if not export_args:
             continue
-        file_args = _generate_exiftool_args_for_file(merged_meta)
+        file_args = _generate_exiftool_args_for_file(export_args)
         if file_args:
             command_args.extend(file_args)
             command_args.append(output_path)
             command_args.append("-execute")
+
     if not command_args:
         return
+
     final_args = base_args + command_args[:-1]
     try:
         subprocess.run(final_args, check=True, capture_output=True, text=True, encoding='utf-8')
@@ -209,13 +171,14 @@ def generate_relative_export_path(media_file: models.MediaFile, merged_metadata:
     # 4. Final fallback for files with no usable date information
     return os.path.join("Unknown_Date", filename)
 
+
 def process_export_batch(
         batch_locations: List[models.Location],
         export_dir: str,
         conflict_dir: str,
         executor: ThreadPoolExecutor,
         logger: logging.Logger,
-        conflict_fp,  # File pointer for writing conflict paths
+        conflict_fp,
         pipeline: MergePipeline,
         processed_media_ids: set
 ) -> Dict[str, Any]:
@@ -223,20 +186,38 @@ def process_export_batch(
     stats = {"exported": 0, "skipped": 0, "conflicts": 0}
     files_to_copy = []
     files_to_copy_conflict = []
-    files_for_metadata = []
+    files_for_metadata: List[Tuple[str, List[ExportArgument]]] = []
 
     for loc in batch_locations:
         if loc.media_file.id in processed_media_ids:
             stats["skipped"] += 1
             continue
 
-        metadata_sources = loc.media_file.metadata_sources
-        if not metadata_sources:
-            stats["skipped"] += 1
-            print("Skipped file with no metadata sources:", loc.path)
-            continue
-        result_context = pipeline.run(metadata_sources)
+        # Get all locations for this media file
+        all_locations_for_file = loc.media_file.locations
 
+        # Sort them by file size (desc) and then by location ID (asc)
+        # We use os.path.getsize() for the most accurate current size.
+        sorted_locations = sorted(
+            all_locations_for_file,
+            key=lambda l: (-l.file_size, l.id)
+        )
+
+        # The best location to copy from is the first one in the sorted list
+        source_loc_to_copy = sorted_locations[0]
+
+        # IMPORTANT: A file's canonical metadata is derived from ALL its locations.
+        all_sources_for_file = [source for location in loc.media_file.locations for source in location.metadata_sources]
+        if not all_sources_for_file:
+            stats["skipped"] += 1
+            continue
+
+        result_context = pipeline.run(all_sources_for_file)
+
+        # Get the final arguments. This also runs the conflict check internally.
+        final_arguments = result_context.get_all_arguments()
+
+        # Check for any conflicts recorded during the merge process OR by the argument validation.
         if result_context.conflicts:
             stats["conflicts"] += 1
             log_conflict(logger, loc.path, result_context.conflicts)
@@ -247,6 +228,7 @@ def process_export_batch(
                 files_to_copy_conflict.append((loc.path, conflict_output_path))
             continue
 
+        # Pass the raw merged_data dict for path generation, as it contains simple values.
         relative_path = generate_relative_export_path(loc.media_file, result_context.merged_data)
         output_path = os.path.join(export_dir, relative_path)
 
@@ -257,8 +239,8 @@ def process_export_batch(
             stats["skipped"] += 1
             continue
 
-        files_to_copy.append((loc.path, output_path))
-        files_for_metadata.append((output_path, result_context.merged_data))
+        files_to_copy.append((source_loc_to_copy.path, output_path))
+        files_for_metadata.append((output_path, final_arguments))
         processed_media_ids.add(loc.media_file.id)
 
     if files_to_copy:
@@ -321,8 +303,9 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
 
     export_merge_pipeline = MergePipeline(steps=[
         GPSMergeStep(),
-        DateTimeAndZoneMergeStep("date_taken"),
-        DateTimeAndZoneMergeStep("date_modified"),
+        BasicFieldMergeStep("Composite:GPSDateTime"),
+        DateTimeAndZoneMergeStep("taken"),
+        DateTimeAndZoneMergeStep("modified"),
     ])
 
 
@@ -348,7 +331,7 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
                 print("No files found to process.")
                 return
 
-            total_size_bytes = sum(loc.media_file.file_size for loc in locations_to_export)
+            total_size_bytes = sum(loc.file_size for loc in locations_to_export)
             total_files = len(locations_to_export)
             print(f"Found {total_files} files to process for export ({total_size_bytes / (1024 ** 3):.2f} GB).")
 

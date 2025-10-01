@@ -76,12 +76,17 @@ def save_batch_to_db(db: Session, owner: models.Owner, batch_data: Dict) -> (Dic
 
                 location_obj = existing_locations.get(abs_path)
                 if not location_obj:
-                    location_obj = models.Location(path=abs_path, filename=os.path.basename(abs_path),
-                                                   media_file=media_file_obj)
+                    location_obj = models.Location(
+                        path=abs_path,
+                        filename=os.path.basename(abs_path),
+                        media_file=media_file_obj,
+                        file_size=data["location_data"]["file_size"],
+                    )
                     db.add(location_obj)
                     stats["inserted"] += 1
                 else:
                     stats["updated"] += 1
+                    location_obj.file_size = data["location_data"]["file_size"]
                     if location_obj.media_file.file_hash != current_hash:
                         raise ValueError(
                             f"Hash conflict: path points to a different file. Old: {location_obj.media_file.file_hash}, New: {current_hash}")
@@ -92,20 +97,27 @@ def save_batch_to_db(db: Session, owner: models.Owner, batch_data: Dict) -> (Dic
                 # Your location-specific metadata upsert logic from before
                 def upsert_metadata(source_name: str, source_data: Dict):
                     if not source_data: return
-                    metadata_entry = db.query(models.Metadata).filter_by(location_id=location_obj.id,
-                                                                         source=source_name).first()
-                    parsed = source_data["parsed"]
-                    if metadata_entry:
-                        metadata_entry.date_taken, metadata_entry.date_taken_key, metadata_entry.date_modified, metadata_entry.date_modified_key, metadata_entry.gps_latitude, metadata_entry.gps_longitude, metadata_entry.raw_data = parsed.get(
-                            "date_taken"), parsed.get("date_taken_key"), parsed.get("date_modified"), parsed.get("date_modified_key"), parsed.get("gps_latitude"), parsed.get("gps_longitude"), source_data["raw"]
-                    else:
-                        db.add(models.Metadata(media_file=media_file_obj, location=location_obj, source=source_name,
-                                               date_taken=parsed.get("date_taken"),
-                                               date_taken_key=parsed.get("date_taken_key"),
-                                               date_modified=parsed.get("date_modified"),
-                                               date_modified_key=parsed.get("date_modified_key"),
-                                               gps_latitude=parsed.get("gps_latitude"),
-                                               gps_longitude=parsed.get("gps_longitude"), raw_data=source_data["raw"]))
+
+                    # First, delete the old source object and all its cascaded entries
+                    db.query(models.MetadataSource).filter_by(
+                        location_id=location_obj.id,
+                        source=source_name
+                    ).delete(synchronize_session=False)
+
+                    # Create the new single source record that holds the raw data
+                    source_obj = models.MetadataSource(
+                        location=location_obj,
+                        source=source_name,
+                        raw_data=source_data["raw"]
+                    )
+                    db.add(source_obj)
+
+                    # Then, create the individual key-value entries linked to the new source record
+                    for entry_data in source_data["parsed"]:
+                        db.add(models.MetadataEntry(
+                            source_info=source_obj,
+                            **entry_data
+                        ))
 
                 upsert_metadata('exif', data.get("exif_metadata"))
                 upsert_metadata('google_json', data.get("google_metadata"))

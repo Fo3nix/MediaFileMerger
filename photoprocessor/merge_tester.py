@@ -8,7 +8,7 @@ from tqdm import tqdm
 from sqlalchemy.orm import Session
 from photoprocessor import models
 from photoprocessor.database import SessionLocal
-from photoprocessor.merger import GPSMergeStep, DateTimeAndZoneMergeStep, MergePipeline
+from photoprocessor.merger import GPSMergeStep, DateTimeAndZoneMergeStep, MergePipeline, BasicFieldMergeStep
 from photoprocessor.export_pipe import get_locations_for_owner, get_locations_by_paths, log_conflict
 
 # Configuration (can be smaller as it's not I/O intensive)
@@ -30,7 +30,7 @@ def process_test_batch(
     stats = {"scanned": 0, "conflicts": 0}
     for loc in batch_locations:
         stats["scanned"] += 1
-        metadata_sources = loc.media_file.metadata_sources
+        metadata_sources = loc.media_file.all_metadata_sources
         if not metadata_sources:
             continue
 
@@ -73,8 +73,9 @@ def merge_tester_main(owner_name: str, filelist_path: str = None):
     # --- Instantiate the exact same pipeline from the export process ---
     export_merge_pipeline = MergePipeline(steps=[
         GPSMergeStep(),
-        DateTimeAndZoneMergeStep("date_taken"),
-        DateTimeAndZoneMergeStep("date_modified"),
+        BasicFieldMergeStep("Composite:GPSDateTime"),
+        DateTimeAndZoneMergeStep("taken"),
+        DateTimeAndZoneMergeStep("modified"),
     ])
 
     try:
