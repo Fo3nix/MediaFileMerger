@@ -31,10 +31,10 @@ class SimpleArgument(ExportArgument):
     def build(self) -> List[str]:
         if not self.value:
             return []
-        return [f"{self.tag}={self.value}"]
+        return [f"-{self.tag}={self.value}"]
 
     def get_managed_tags(self) -> Set[str]:
-        return {self.tag}
+        return {f"-{self.tag}"}
 
 
 class DateTimeArgument(ExportArgument):
@@ -118,19 +118,3 @@ class DateTimeArgument(ExportArgument):
                 ])
 
         return args
-
-
-class GPSArgument(ExportArgument):
-    """Handles writing a single GPS coordinate."""
-
-    def __init__(self, value: float, coordinate_type: str):
-        """coordinate_type must be 'latitude' or 'longitude'."""
-        super().__init__(value)
-        if coordinate_type not in ["latitude", "longitude"]:
-            raise ValueError("coordinate_type must be 'latitude' or 'longitude'")
-        self.tag = f"-GPS{coordinate_type.capitalize()}"
-
-    def build(self) -> List[str]:
-        if self.value is None:
-            return []
-        return [f"{self.tag}={self.value}"]
