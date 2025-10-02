@@ -34,7 +34,7 @@ def get_or_create_owner(db: Session, name: str) -> models.Owner:
     if not owner:
         owner = models.Owner(name=name)
         db.add(owner)
-        db.commit();
+        db.commit()
         db.refresh(owner)
     return owner
 

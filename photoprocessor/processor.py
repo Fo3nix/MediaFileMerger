@@ -273,7 +273,7 @@ class PhotoProcessor:
 
             args = [
                 "exiftool",
-                # "-api", "QuickTimeUTC",  # Turns QuickTime dates into my local timezone
+                # "-api", "QuickTimeUTC",  # Turns QuickTime dates into my local timezone !!NOT WANTED!!
                 "-d", "%Y-%m-%dT%H:%M:%S%:z",  # This format is correct
                 "-G", "-n", "-json", "-a",
                 *required_tags,
