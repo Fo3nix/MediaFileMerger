@@ -13,7 +13,7 @@ from tqdm import tqdm
 from sqlalchemy.orm import Session, selectinload
 from photoprocessor.database import engine, SessionLocal
 from photoprocessor import models
-from photoprocessor.export_arguments import ExportArgument
+from photoprocessor.export_arguments import ExportArgument, DateTimeArgument
 from photoprocessor.merger import MergeStep, GPSMergeStep, MergeContext, BasicFieldMergeStep, MergePipeline, \
     DateTimeAndZoneMergeStep
 
@@ -129,7 +129,7 @@ def log_conflict(logger: logging.Logger, file_path: str, conflicts: Dict[str, Li
     logger.warning(f"{file_path}\n    {details_str}")
 
 
-def generate_relative_export_path(media_file: models.MediaFile, merged_metadata: Dict[str, Any]) -> str:
+def generate_relative_export_path(media_file: models.MediaFile, export_arguments: List[ExportArgument]) -> str:
     """
     Generates the full relative export path for a media file based on a prioritized
     set of rules, falling back to a year-based structure using the merged metadata.
@@ -163,9 +163,21 @@ def generate_relative_export_path(media_file: models.MediaFile, merged_metadata:
             return os.path.join("Whatsapp Images", filename)
 
     # --- 3. Default to Year-Based Pathing using Merged Date ---
-    date_taken = merged_metadata.get("date_taken")
+
+    date_taken = None
+    date_modified = None
+    for arg in export_arguments:
+        if isinstance(arg, DateTimeArgument):
+            if arg.date_type == "taken" and isinstance(arg.value, datetime):
+                date_taken = arg.value
+            elif arg.date_type == "modified" and isinstance(arg.value, datetime):
+                date_modified = arg.value
+
     if date_taken and isinstance(date_taken, datetime):
         year_str = str(date_taken.year)
+        return os.path.join(year_str, filename)
+    elif date_modified and isinstance(date_modified, datetime):
+        year_str = str(date_modified.year)
         return os.path.join(year_str, filename)
 
     # 4. Final fallback for files with no usable date information
@@ -229,7 +241,7 @@ def process_export_batch(
             continue
 
         # Pass the raw merged_data dict for path generation, as it contains simple values.
-        relative_path = generate_relative_export_path(loc.media_file, result_context.merged_data)
+        relative_path = generate_relative_export_path(loc.media_file, final_arguments)
         output_path = os.path.join(export_dir, relative_path)
 
         output_dir_for_file = os.path.dirname(output_path)
