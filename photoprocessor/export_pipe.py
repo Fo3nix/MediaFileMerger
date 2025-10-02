@@ -20,7 +20,7 @@ from photoprocessor.merger import MergeStep, GPSMergeStep, MergeContext, BasicFi
 # --- Configuration ---
 CONFIG = {
     "EXIFTOOL_PATH": "exiftool",
-    "BATCH_SIZE": 75,
+    "BATCH_SIZE": 50,
     "MAX_COPY_WORKERS": 8,
 }
 
