@@ -269,11 +269,33 @@ class DateTimeAndZoneMergeStep(MergeStep):
             data to serve as a tie-breaker.
     """
 
+    UTC_KEYS = {
+        "QuickTime:CreationDate",
+        "QuickTime:CreateDate",
+        "QuickTime:ModifyDate",
+        "Composite:GPSDateTime",
+        "Keys:CreationDate",
+    }
+
     def __init__(self, date_type: str):
         if date_type not in ("taken", "modified"):
             raise ValueError("date_type must be 'taken' or 'modified'")
         self.date_type = date_type
         self.tz_finder = TimezoneFinder()
+
+    def _normalize_utc_keys(self, entries: List[models.MetadataEntry]):
+        """
+        Finds entries with known UTC keys and ensures their datetimes are timezone-aware.
+        If a naive datetime is found for a UTC key, it is localized to UTC.
+        This method modifies the MetadataEntry objects in place.
+        """
+        for entry in entries:
+            # Check if the key is one that should be treated as UTC
+            if entry.key in self.UTC_KEYS:
+                # Check if the datetime value exists and is naive (lacks timezone info)
+                if entry.value_dt and entry.value_dt.tzinfo is None:
+                    # Localize the naive datetime to UTC, as this is its correct interpretation
+                    entry.value_dt = entry.value_dt.replace(tzinfo=timezone.utc)
 
     def _detect_date_from_file_name(self, filename: str) -> datetime | None:
         """
@@ -421,6 +443,8 @@ class DateTimeAndZoneMergeStep(MergeStep):
                 #return cause conflict
                 return
             all_values.extend(filename_dates)
+
+        self._normalize_utc_keys(all_values)
 
         # Check that all values are datetime objects
         if not all(isinstance(s.value_dt, datetime) for s in all_values):
