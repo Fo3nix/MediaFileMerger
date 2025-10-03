@@ -94,15 +94,14 @@ def save_batch_to_db(db: Session, owner: models.Owner, batch_data: Dict) -> (Dic
                 if owner not in [own.owner for own in location_obj.owners]:
                     db.add(models.MediaOwnership(owner=owner, location=location_obj))
 
-                # Your location-specific metadata upsert logic from before
-                def upsert_metadata(source_name: str, source_data: Dict):
-                    if not source_data: return
-
-                    # First, delete the old source object and all its cascaded entries
+                def clear_metadata():
                     db.query(models.MetadataSource).filter_by(
-                        location_id=location_obj.id,
-                        source=source_name
+                        location_id=location_obj.id
                     ).delete(synchronize_session=False)
+
+                # Your location-specific metadata upsert logic from before
+                def insert_metadata(source_name: str, source_data: Dict):
+                    if not source_data: return
 
                     # Create the new single source record that holds the raw data
                     source_obj = models.MetadataSource(
@@ -119,8 +118,11 @@ def save_batch_to_db(db: Session, owner: models.Owner, batch_data: Dict) -> (Dic
                             **entry_data
                         ))
 
-                upsert_metadata('exif', data.get("exif_metadata"))
-                upsert_metadata('google_json', data.get("google_metadata"))
+                clear_metadata()
+                insert_metadata('exif', data.get("exif_metadata"))
+                for i, json_meta in enumerate(data.get("google_metadata_list", [])):
+                    insert_metadata(f'google_json_{i+1}', json_meta)
+
 
         except Exception as e:
             db.rollback()

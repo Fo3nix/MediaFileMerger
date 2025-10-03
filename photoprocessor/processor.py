@@ -10,6 +10,8 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from queue import Queue, Empty
 from functools import lru_cache
 
+from photoprocessor.google_json_finder import GoogleJsonFinder
+
 import imagehash
 import cv2
 import hashlib
@@ -18,18 +20,6 @@ import re
 
 from pillow_heif import register_heif_opener
 register_heif_opener()
-
-@lru_cache(maxsize=256)
-def get_directory_contents(directory_path: str) -> set:
-    """
-    Lists the contents of a directory and returns them as a set for fast lookups.
-    The @lru_cache decorator automatically caches the results, so os.listdir()
-    is only called once for each unique directory.
-    """
-    try:
-        return set(os.listdir(directory_path))
-    except (FileNotFoundError, NotADirectoryError):
-        return set()
 
 def _validate_gps(lat, lon) -> bool:
     """Validates GPS coordinates."""
@@ -207,53 +197,13 @@ def _hash_file_partially(filepath: str, chunk_size=1024 * 1024) -> str:
     except (FileNotFoundError, OSError):
         return ""
 
-
-def _standalone_get_google_json_dict(image_path: str) -> dict | None:
-    """
-    Finds and reads all corresponding Google Takeout JSON metadata files
-    using regex, merging them into a single dictionary.
-    """
-    directory = os.path.dirname(image_path)
-    dir_contents = get_directory_contents(directory)
-    if not dir_contents:
-        return None
-
-    # Get the filename without its extension
-    base_filename = os.path.splitext(os.path.basename(image_path))[0]
-
-    # Handle Google's "-edited" suffix by looking for the original name
-    if "-edited" in base_filename:
-        base_filename = base_filename.replace("-edited", "")
-
-    # Create a regex pattern to match:
-    # ^                  - Start of the string
-    # (re.escape(...))   - The literal base filename
-    # .* - Any characters (the "SOMETHING")
-    # \.json$            - Ending with exactly ".json"
-    pattern = re.compile(rf"^{re.escape(base_filename)}.*\.json$")
-
-    # Find all matching files in the directory
-    found_files = [f for f in dir_contents if pattern.match(f)]
-    if not found_files:
-        return None
-
-    merged_data = {}
-    for filename in found_files:
-        json_path = os.path.join(directory, filename)
-        try:
-            with open(json_path, 'r', encoding='utf-8') as f:
-                merged_data.update(json.load(f))
-        except Exception:
-            continue
-
-    return merged_data if merged_data else None
-
 class PhotoProcessor:
     """Processes a single photo file to extract and structure data for the database."""
 
     def __init__(self):
         """Initializes the PhotoProcessor and its tools."""
         self.tf = TimezoneFinder()
+        self.json_finder = GoogleJsonFinder()
 
     def _get_exiftool_batch_dict(self, filepaths: list[str]) -> list[dict]:
         """
@@ -467,7 +417,7 @@ class PhotoProcessor:
                 try:
                     abs_path = os.path.abspath(path)
                     raw_exif_dict = exif_map.get(abs_path)
-                    google_json_dict = _standalone_get_google_json_dict(path)
+                    google_json_list = self.json_finder.get_metadata_for_file(path)
 
                     mime_type = raw_exif_dict.get("File:MIMEType",
                                                   "unknown/unknown") if raw_exif_dict else "unknown/unknown"
@@ -484,7 +434,7 @@ class PhotoProcessor:
                         "path": path,
                         "image_obj": image_obj,
                         "raw_exif_dict": raw_exif_dict,
-                        "google_json_dict": google_json_dict,
+                        "google_json_list": google_json_list,
                         "mime_type": mime_type
                     })
                 except Exception as e:
@@ -520,7 +470,16 @@ class PhotoProcessor:
                         raise ValueError("Hashing failed")
 
                     raw_exif_dict = data["raw_exif_dict"]
-                    google_json_dict = data["google_json_dict"]
+                    google_json_list = data["google_json_list"]
+
+                    # Create List of dicts for google metadata
+                    google_metadata_list = []
+                    for google_json_dict in google_json_list:
+                        if google_json_dict:  # Ensure dict is not None or empty
+                            google_metadata_list.append({
+                                "parsed": self._parse_key_google_fields(google_json_dict),
+                                "raw": google_json_dict
+                            })
 
                     successes[path] = {
                         "location_data": {
@@ -533,8 +492,7 @@ class PhotoProcessor:
                         },
                         "exif_metadata": {"parsed": self._parse_key_exif_fields(raw_exif_dict),
                                           "raw": raw_exif_dict} if raw_exif_dict else None,
-                        "google_metadata": {"parsed": self._parse_key_google_fields(google_json_dict),
-                                            "raw": google_json_dict} if google_json_dict else None
+                        "google_metadata_list": google_metadata_list
                     }
                 except Exception as e:
                     failures.append({"path": path, "error": str(e)})
