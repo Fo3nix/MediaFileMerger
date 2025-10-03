@@ -607,7 +607,7 @@ class DateTimeAndZoneMergeStep(MergeStep):
             msg = (f"Found multiple distinct naive times {sorted(unique_naive_groups.keys())}, creating ambiguity. "
                    f"While a final value was determined from higher-priority data, this conflict in the source is being noted. Chosen value: {final_value.isoformat()}. "
                    f"Source IDs: {conflicting_ids}")
-            # context.record_conflict(self.date_type, msg)
+            context.record_conflict(self.date_type, msg)
 
         if final_value is not None:
             return final_value
