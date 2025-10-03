@@ -71,12 +71,7 @@ def merge_tester_main(owner_name: str, filelist_path: str = None):
     total_stats = {"scanned": 0, "conflicts": 0}
 
     # --- Instantiate the exact same pipeline from the export process ---
-    export_merge_pipeline = MergePipeline(steps=[
-        GPSMergeStep(),
-        BasicFieldMergeStep("Composite:GPSDateTime"),
-        DateTimeAndZoneMergeStep("taken"),
-        DateTimeAndZoneMergeStep("modified"),
-    ])
+    export_merge_pipeline = MergePipeline.get_default_pipeline()
 
     try:
         with SessionLocal() as db, open(conflict_paths_file, 'w', encoding='utf-8') as conflict_fp:

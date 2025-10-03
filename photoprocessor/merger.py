@@ -591,11 +591,53 @@ class DateTimeAndZoneMergeStep(MergeStep):
             return None
 
 
+class FallbackModifiedDateStep(MergeStep):
+    """
+    Sets the modified date to the taken date if no modified date was found
+    and no conflicts occurred during the initial modified date merge.
+    This step should run AFTER the primary DateTimeAndZoneMergeStep for 'modified'.
+    """
+    def process(self, context: MergeContext):
+        # 1. Check if a 'modified' date has already been successfully merged.
+        if "modified" in context.finalized_fields:
+            return  # A value already exists, so do nothing.
+
+        # 2. Check if the original 'modified' date step recorded a conflict.
+        if "modified" in context.conflicts:
+            return  # There was a conflict, so we should not apply a fallback.
+
+        # 3. If we proceed, it means 'modified' is empty and conflict-free.
+        #    Try to get the 'taken' date value, which should have been finalized by a previous step.
+        try:
+            taken_date_arg = context.get_value("taken", required=True)
+        except RuntimeError:
+            # This should not happen if the pipeline is ordered correctly, but it's a safe check.
+            return
+
+        if taken_date_arg and isinstance(taken_date_arg, DateTimeArgument):
+            # Create a new ExportArgument for 'modified' using the value from 'taken'.
+            fallback_value = taken_date_arg.value
+            modified_arg = DateTimeArgument(fallback_value, "modified")
+
+            # Set the final value for 'modified' in the context.
+            context.set_value("modified", modified_arg)
+
 # --- The Pipeline Orchestrator ---
 
 class MergePipeline:
     def __init__(self, steps: List[MergeStep]):
         self.steps = steps
+
+    @classmethod
+    def get_default_pipeline(cls) -> 'MergePipeline':
+        steps: List[MergeStep] = [
+            GPSMergeStep(),
+            BasicFieldMergeStep("Composite:GPSDateTime"),
+            DateTimeAndZoneMergeStep("taken"),
+            DateTimeAndZoneMergeStep("modified"),
+            FallbackModifiedDateStep(),
+        ]
+        return cls(steps)
 
     def run(self, sources: List[models.MetadataSource]) -> MergeContext:
         context = MergeContext(sources)

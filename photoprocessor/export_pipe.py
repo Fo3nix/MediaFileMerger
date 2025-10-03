@@ -313,14 +313,7 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
     processed_media_ids = set()
 
 
-    export_merge_pipeline = MergePipeline(steps=[
-        GPSMergeStep(),
-        BasicFieldMergeStep("Composite:GPSDateTime"),
-        DateTimeAndZoneMergeStep("taken"),
-        DateTimeAndZoneMergeStep("modified"),
-    ])
-
-
+    export_merge_pipeline = MergePipeline.get_default_pipeline()
 
     try:
         with SessionLocal() as db, ThreadPoolExecutor(max_workers=CONFIG["MAX_COPY_WORKERS"]) as executor, \
