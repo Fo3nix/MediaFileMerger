@@ -155,12 +155,16 @@ def generate_relative_export_path(media_file: models.MediaFile, export_arguments
             if pattern in path:
                 return os.path.join(target_subdir, filename)  # Return full relative path
 
-    # 2. Check filename pattern as a fallback rule for WhatsApp
+    # 2. Check filename pattern
     if re.search(r'-WA\d{4}', filename, re.IGNORECASE):
         if media_file.mime_type.startswith('video/'):
             return os.path.join("Whatsapp Video", filename)
         else:
             return os.path.join("Whatsapp Images", filename)
+
+    # - check screenshots in filename
+    if re.search(r'screenshot', filename, re.IGNORECASE):
+        return os.path.join("Screenshots", filename)
 
     # --- 3. Default to Year-Based Pathing using Merged Date ---
 
