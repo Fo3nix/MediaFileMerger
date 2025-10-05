@@ -8,7 +8,6 @@ from datetime import datetime, timezone, timedelta
 from photoprocessor.export_arguments import DateTimeArgument, SimpleArgument, ExportArgument
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
 
 from photoprocessor.models import MetadataEntry
 
