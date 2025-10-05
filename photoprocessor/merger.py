@@ -7,6 +7,8 @@ from photoprocessor.merge_rules import rules
 from datetime import datetime, timezone, timedelta
 from photoprocessor.export_arguments import DateTimeArgument, SimpleArgument, ExportArgument
 import re
+from dataclasses import dataclass, field
+from datetime import datetime
 
 from photoprocessor.models import MetadataEntry
 
@@ -227,6 +229,111 @@ class GPSMergeStep(MergeStep):
             final_tag="GPSLongitude"
         )
 
+@dataclass
+class DateTimeCandidate:
+    """Represents a cluster of nearly identical datetime values."""
+    representative_value: datetime
+    source_keys: Set[str|tuple[str,str]] = field(default_factory=set)
+    source_ids: Set[int|tuple[int,int]] = field(default_factory=set)
+
+    @classmethod
+    def from_entry(cls, entry: MetadataEntry) -> 'DateTimeCandidate':
+        """Creates a DateTimeCandidate from a single MetadataEntry."""
+        return cls(
+            representative_value=entry.value_dt,
+            source_keys={entry.key},
+            source_ids={entry.id}
+        )
+
+    @property
+    def is_aware(self) -> bool:
+        """Checks if the representative datetime is timezone-aware."""
+        return self.representative_value.tzinfo is not None
+
+    def __repr__(self) -> str:
+        return (f"DateTimeCandidate(value='{self.representative_value.isoformat()}',"
+                f" keys={self.source_keys}, ids={self.source_ids})")
+
+class DateTimeCandidateContainer:
+    """Manages a collection of DateTimeCandidate objects, merging them on the fly."""
+
+    def __init__(self, tolerance: timedelta = timedelta(seconds=5)):
+        self._candidates: List[DateTimeCandidate] = []
+        self.tolerance = tolerance
+
+    @property
+    def candidates(self) -> List[DateTimeCandidate]:
+        """Returns a copy of all current candidates."""
+        return list(self._candidates)
+
+    @property
+    def aware_candidates(self) -> List[DateTimeCandidate]:
+        """Returns all timezone-aware candidates."""
+        return [c for c in self._candidates if c.is_aware]
+
+    @property
+    def naive_candidates(self) -> List[DateTimeCandidate]:
+        """Returns all naive (timezone-unaware) candidates."""
+        return [c for c in self._candidates if not c.is_aware]
+
+    def _is_match(self, cand1: DateTimeCandidate, cand2: DateTimeCandidate) -> bool:
+        """Checks if two candidates match based on time and timezone within a tolerance."""
+        if cand1.is_aware != cand2.is_aware:
+            return False  # An aware and a naive time can never match.
+
+        # For aware times, compare their absolute time in UTC and their offset
+        if cand1.is_aware:
+            utc1 = cand1.representative_value.astimezone(timezone.utc)
+            utc2 = cand2.representative_value.astimezone(timezone.utc)
+            offsets_match = cand1.representative_value.utcoffset() == cand2.representative_value.utcoffset()
+            return abs(utc1 - utc2) <= self.tolerance and offsets_match
+        # For naive times, just compare their values directly
+        else:
+            return abs(cand1.representative_value - cand2.representative_value) <= self.tolerance
+
+    def add_candidate(self, new_candidate: DateTimeCandidate):
+        """
+        Adds a new candidate to the container. If it matches one or more existing
+        candidates, they are all merged into a single new candidate.
+        """
+        # Find all existing candidates that match the new one
+        matching_candidates = [c for c in self._candidates if self._is_match(c, new_candidate)]
+
+        if not matching_candidates:
+            # No matches found, just add the new candidate
+            self._candidates.append(new_candidate)
+            return
+
+        # --- Merge Logic ---
+        # Include the new candidate in the list of items to be merged
+        all_to_merge = matching_candidates + [new_candidate]
+
+        # 1. Choose the earliest representative date
+        merged_repr_value = min(c.representative_value for c in all_to_merge)
+
+        # 2. Combine all source keys and IDs into new sets
+        merged_keys = set()
+        merged_ids = set()
+        for c in all_to_merge:
+            merged_keys.update(c.source_keys)
+            merged_ids.update(c.source_ids)
+
+        # 3. Create the new, merged candidate
+        merged_candidate = DateTimeCandidate(
+            representative_value=merged_repr_value,
+            source_keys=merged_keys,
+            source_ids=merged_ids
+        )
+
+        # 4. Remove all the old candidates that were part of the merge
+        self._candidates = [c for c in self._candidates if c not in matching_candidates]
+
+        # 5. Add the single merged candidate
+        self._candidates.append(merged_candidate)
+
+    def __repr__(self) -> str:
+        return f"DateTimeCandidateContainer(candidates={self._candidates})"
+
 class DateTimeAndZoneMergeStep(MergeStep):
     """
     Merges date/time fields by establishing a single, canonical, timezone-aware datetime.
@@ -275,6 +382,7 @@ class DateTimeAndZoneMergeStep(MergeStep):
         "QuickTime:ModifyDate",
         "Composite:GPSDateTime",
         "Keys:CreationDate",
+        "google:photoTakenTime",
     }
 
     def __init__(self, date_type: str):
@@ -283,19 +391,27 @@ class DateTimeAndZoneMergeStep(MergeStep):
         self.date_type = date_type
         self.tz_finder = TimezoneFinder()
 
-    def _normalize_utc_keys(self, entries: List[models.MetadataEntry]):
-        """
-        Finds entries with known UTC keys and ensures their datetimes are timezone-aware.
-        If a naive datetime is found for a UTC key, it is localized to UTC.
-        This method modifies the MetadataEntry objects in place.
-        """
-        for entry in entries:
-            # Check if the key is one that should be treated as UTC
-            if entry.key in self.UTC_KEYS:
-                # Check if the datetime value exists and is naive (lacks timezone info)
-                if entry.value_dt and entry.value_dt.tzinfo is None:
-                    # Localize the naive datetime to UTC, as this is its correct interpretation
-                    entry.value_dt = entry.value_dt.replace(tzinfo=timezone.utc)
+    def _get_metadata_keys(self) -> List[str | tuple[str, str]]:
+        if self.date_type == "taken":
+            return [
+                "XMP:DateTimeOriginal",
+                ("EXIF:DateTimeOriginal", "EXIF:OffsetTimeOriginal"),
+                "EXIF:DateTimeOriginal",
+                "QuickTime:CreationDate",
+                "QuickTime:CreateDate",
+                "Keys:CreationDate",
+                "UserData:DateTimeOriginal",
+                "XMP:CreateDate",
+                "EXIF:CreateDate",
+                "google:photoTakenTime",
+            ]
+        elif self.date_type == "modified":
+            return [
+                "EXIF:ModifyDate",
+                "XMP:ModifyDate",
+                "QuickTime:ModifyDate",
+            ]
+        return []
 
     def _detect_date_from_file_name(self, filename: str) -> datetime | None:
         """
@@ -346,74 +462,7 @@ class DateTimeAndZoneMergeStep(MergeStep):
 
         return None
 
-    def _get_exif_keys(self) -> List[str|tuple[str,str]]:
-        if self.date_type == "taken":
-            return [
-                "XMP:DateTimeOriginal",
-                ("EXIF:DateTimeOriginal", "EXIF:OffsetTimeOriginal"),
-                "EXIF:DateTimeOriginal",
-                "QuickTime:CreationDate",
-                "QuickTime:CreateDate",
-                "Keys:CreationDate",
-                "UserData:DateTimeOriginal",
-                "XMP:CreateDate",
-                "EXIF:CreateDate",
-                "google:photoTakenTime",
-            ]
-        elif self.date_type == "modified":
-            return [
-                "EXIF:ModifyDate",
-                "XMP:ModifyDate",
-                "QuickTime:ModifyDate",
-            ]
-        return []
-
-    def _get_value_from_tag_and_entries(self, tag: str|tuple[str,str], entries: List[models.MetadataEntry]) -> datetime | None:
-        if isinstance(tag, str):
-            for e in entries:
-                if e.key == tag and e.value_dt is not None:
-                    return e.value_dt
-        elif isinstance(tag, tuple) and len(tag) == 2:
-            first_tag, second_tag = tag
-            first_value = self._get_value_from_tag_and_entries(first_tag, entries)
-            second_value = self._get_value_from_tag_and_entries(second_tag, entries)
-
-            # if first_value and second_value are not none
-            if first_value and second_value:
-                # if first value is datetime and second value is string
-                if isinstance(first_value, datetime) and isinstance(second_value, str):
-                    # if first value is naive and second value is in format +HH:MM or -HH:MM
-                    regex_time_offset = r'^[+-](0[0-9]|1[0-4]):([0-5][0-9])$'
-                    if first_value.tzinfo is None and re.match(regex_time_offset, second_value):
-                        hours, minutes = map(int, second_value.split(':'))
-                        offset = timedelta(hours=hours, minutes=minutes)
-                        tzinfo = timezone(offset)
-                        return first_value.replace(tzinfo=tzinfo)
-        return None
-
-    def _get_all_values_from_tags(self, tags: List[str|tuple[str,str]], entries: List[models.MetadataEntry]) -> List[datetime]:
-        values = []
-        for tag in tags:
-            value = self._get_value_from_tag_and_entries(tag, entries)
-            if value is not None:
-                values.append(value)
-        return values
-
-    # Helper function to infer timezone from GPS data
-    def infer_timezone(self, context: MergeContext) -> ZoneInfo | None:
-        lat = context.get_value("gps_latitude")
-        lon = context.get_value("gps_longitude")
-        if lat is None or lon is None:
-            return None
-        tz_name = self.tz_finder.timezone_at(lat=lat, lng=lon)
-        if tz_name is None:
-            return None
-        try:
-            return ZoneInfo(tz_name)
-        except Exception:
-            return None
-
-    def _process_filenames(self, context: MergeContext) -> List[MetadataEntry]|None:
+    def _get_filename_date_candidates(self, context: MergeContext) -> List[DateTimeCandidate] | None:
         # Attempt to extract dates from filenames as a last resort
         file_name_entries = context.get_entries_by_keys(["google:title", "exiftool:SourceFile"])
         for entry in file_name_entries:
@@ -431,188 +480,288 @@ class DateTimeAndZoneMergeStep(MergeStep):
             return None
 
         # return entries with value_dt set
-        return [e for e in file_name_entries if e.value_dt is not None]
+        return [DateTimeCandidate.from_entry(e) for e in file_name_entries if e.value_dt is not None]
+
+    def _get_candidate(self, key: str|tuple[str,str], entries: List[models.MetadataEntry]) -> DateTimeCandidate | None:
+
+        def _get_value_from_key_and_entries(key: str, entries: List[models.MetadataEntry]) -> Any:
+            for ent in entries:
+                if ent.key == key:
+                    return ent.value
+
+        if isinstance(key, str):
+            for e in entries:
+                if e.key == key and e.value_dt is not None:
+                    if e.value_dt.tzinfo is not None or e.key not in self.UTC_KEYS:
+                        return DateTimeCandidate.from_entry(e)
+                    else:
+                        # If the key is a known UTC key but the datetime is naive, localize it to UTC
+                        utc_dt = e.value_dt.replace(tzinfo=timezone.utc)
+                        return DateTimeCandidate(
+                            representative_value=utc_dt,
+                            source_keys={e.key},
+                            source_ids={e.id}
+                        )
+
+        elif isinstance(key, tuple) and len(key) == 2:
+            first_key, second_key = key
+
+            first_value = _get_value_from_key_and_entries(first_key, entries)
+            second_value = _get_value_from_key_and_entries(second_key, entries)
+
+            # if first_value and second_value are not none
+            if first_value and second_value:
+                # if first value is datetime and second value is string
+                if isinstance(first_value, datetime) and isinstance(second_value, str):
+                    # if first value is naive and second value is in format +HH:MM or -HH:MM
+                    regex_time_offset = r'^[+-](0[0-9]|1[0-4]):([0-5][0-9])$'
+                    if first_value.tzinfo is None and re.match(regex_time_offset, second_value):
+                        hours, minutes = map(int, second_value.split(':'))
+                        offset = timedelta(hours=hours, minutes=minutes)
+                        tzinfo = timezone(offset)
+                        date = first_value.replace(tzinfo=tzinfo)
+
+                        return DateTimeCandidate(
+                            representative_value=date,
+                            source_keys={key},
+                            source_ids={e.id for e in entries if e.key in key}
+                        )
+
+        return None
+
+    def _get_candidate_container(self, keys: List[str|tuple[str,str]], entries: List[models.MetadataEntry]) -> DateTimeCandidateContainer:
+        container = DateTimeCandidateContainer()
+
+        for key in keys:
+            candidate = self._get_candidate(key, entries)
+            if candidate:
+                container.add_candidate(candidate)
+
+        return container
+
+    def infer_timezone(self, context: MergeContext) -> ZoneInfo | None:
+        lat = context.get_value("gps_latitude")
+        lon = context.get_value("gps_longitude")
+        if lat is None or lon is None:
+            return None
+        tz_name = self.tz_finder.timezone_at(lat=lat, lng=lon)
+        if tz_name is None:
+            return None
+        try:
+            return ZoneInfo(tz_name)
+        except Exception:
+            return None
 
     def process(self, context: MergeContext):
-        # Get all MetadataEntry objects that have a key for the target field
-        all_values = context.get_entries_by_keys(self._get_exif_keys())
+        # STEP 1: Gather all datetime candidates from metadata entries
+        candidate_container = self._get_candidate_container(self._get_metadata_keys(), context.entries)
 
+        # Also consider dates inferred from filenames, if date_type is taken
         if self.date_type == "taken":
-            filename_dates = self._process_filenames(context)
-            if filename_dates is None:
-                #return cause conflict
-                return
-            all_values.extend(filename_dates)
-
-        self._normalize_utc_keys(all_values)
-
-        # Check that all values are datetime objects
-        if not all(isinstance(s.value_dt, datetime) for s in all_values):
-            raise TypeError(f"All values for {self.date_type} must be datetime objects")
-
-        # Separate the SOURCE OBJECTS into aware and naive lists
-        aware_sources = [s for s in all_values if s.value_dt.tzinfo is not None]
-        naive_sources = [s for s in all_values if s.value_dt.tzinfo is None]
+            filename_candidates = self._get_filename_date_candidates(context)
+            if filename_candidates:
+                for fc in filename_candidates:
+                    candidate_container.add_candidate(fc)
 
         inferred_tz = self.infer_timezone(context)
+        aware_candidates = candidate_container.aware_candidates
+        naive_candidates = candidate_container.naive_candidates
 
         value = None
-        if not aware_sources:
-            value = self._process_only_naive(context, naive_sources, inferred_tz)
+        if aware_candidates:
+            value = self._resolve_with_aware(context, aware_candidates, naive_candidates, inferred_tz)
         else:
-            value = self._process_with_aware(context, aware_sources, naive_sources, inferred_tz)
-
-        if not value:
-            # try to see if we can get the composte:GPSDateTime tag
-            gps_datetime = context.get_value("Composite:GPSDateTime")
-            if isinstance(gps_datetime, datetime):
-                value = gps_datetime.astimezone(inferred_tz) if inferred_tz else gps_datetime
+            value = self._resolve_with_naive_only(context, naive_candidates, inferred_tz)
 
         if value:
             export_arg = DateTimeArgument(value, self.date_type)
             context.set_value(self.date_type, export_arg)
 
-    def _process_only_naive(self, context: MergeContext, naive_sources: list[models.MetadataEntry],
-                            inferred_tz: ZoneInfo | None):
-        if not naive_sources:
+    def _resolve_with_aware(self, context: MergeContext, aware_candidates: List[DateTimeCandidate],
+                            naive_candidates: List[DateTimeCandidate], inferred_tz: ZoneInfo | None):
+
+        # 0. There should be at least one aware candidate here
+        if not aware_candidates:
+            context.record_conflict(self.date_type, "No timezone-aware datetime candidates available for resolution.")
             return None
 
-        # Group sources by their naive datetime value
-        unique_naive_groups = {}
-        for s in naive_sources:
-            unique_naive_groups.setdefault(s.value_dt, []).append(s.id)
+        # 1. if multiple aware candidates, conflict, as these should have been merged already
+        if len(aware_candidates) > 1:
+            context.record_conflict(self.date_type, f"Multiple distinct timezone-aware datetime candidates found: {aware_candidates}")
+            return None
 
-        if len(unique_naive_groups) == 1:
-            # Success, all are the same
-            single_value = list(unique_naive_groups.keys())[0]
+
+        primary_candidate = aware_candidates[0]
+
+        # The primary candidate is assumed to be in UTC if all its source keys are in UTC_KEYS and its tzinfo is UTC
+        primary_candidate_timezone_assumed_utc = primary_candidate.representative_value.tzinfo is timezone.utc \
+                                                 and primary_candidate.source_keys.intersection(self.UTC_KEYS) == primary_candidate.source_keys
+
+        # 2. Check the primary candidate against the gps inferred timezone if available
+        if inferred_tz:
+            # 2.1 If the primary candidate is assumed to be in UTC, convert it to the inferred timezone
+            # 2.2 If not, then the primary candidate is already in a local timezone, so it needs to match the inferred timezone
+            if primary_candidate_timezone_assumed_utc:
+                primary_candidate.representative_value = primary_candidate.representative_value.astimezone(inferred_tz)
+                primary_candidate_timezone_assumed_utc = False
+            else:
+                if primary_candidate.representative_value.tzinfo != inferred_tz:
+                    context.record_conflict(self.date_type, f"The timezone-aware datetime candidate '{primary_candidate}' has a different timezone than the GPS-inferred timezone '{inferred_tz.key}'.")
+                    return None
+
+        # 3. If there are no naive candidates, we can return the primary candidate as is
+        if not naive_candidates:
+            return primary_candidate.representative_value
+
+        # 4. If primary timezone is still assumed to be UTC, we can try to infer the offset from naive candidates
+        #    If not, we need to validate the naive candidates against the primary candidate's local and utc time
+        if primary_candidate_timezone_assumed_utc:
+            offset = self._infer_timezone_offset_from_naive_candidates(primary_candidate, naive_candidates, context)
+
+            if offset:
+                tz = timezone(offset)
+                primary_candidate.representative_value = primary_candidate.representative_value.astimezone(tz)
+            else:
+                return None
+        else:
+            if not self._validate_aware_against_naive(primary_candidate, naive_candidates, context):
+                return None
+
+
+        return primary_candidate.representative_value
+
+    def _infer_timezone_offset_from_naive_candidates(self, aware_cand: DateTimeCandidate, naive_candidates: List[DateTimeCandidate], context: MergeContext) -> timedelta | None:
+        offsets = set()
+
+        # for each naive candidate, calculate the offset from the aware candidate's UTC time
+        # The offset should be in x hours with a tolerance of 5 seconds
+        for nc in naive_candidates:
+            offset = nc.representative_value - aware_cand.representative_value.astimezone(timezone.utc).replace(tzinfo=None)
+
+            hours = float(offset.total_seconds()) / 3600.0
+            if not (-12 <= hours <= 14):
+                context.record_conflict(self.date_type, f"The naive datetime candidate '{nc}' implies an invalid timezone offset of {offset} from the timezone-aware candidate '{aware_cand}'. Valid offsets are between -12 and +14 hours.")
+                return None
+
+            # offset, amount of seconds shy of a whole 15 minutes
+            offset_dist_from_quarter_hour = abs(offset.total_seconds() % 900)
+
+            if 60 <offset_dist_from_quarter_hour < 830:
+                context.record_conflict(self.date_type, f"The naive datetime candidate '{nc}' implies a timezone offset of {offset} from the timezone-aware candidate '{aware_cand}', which is not a whole number of 15-minute increments (with a tolerance of 1 minute).")
+                return None
+
+            # round to nearest 15 minutes
+            if offset_dist_from_quarter_hour <= 60:
+                offset -= timedelta(seconds=offset_dist_from_quarter_hour)
+            elif offset_dist_from_quarter_hour >= 830:
+                offset += timedelta(seconds=(900 - offset_dist_from_quarter_hour))
+
+            offsets.add(offset)
+        if len(offsets) == 1:
+            return offsets.pop()
+        else:
+            context.record_conflict(self.date_type, f"The naive datetime candidates {naive_candidates} imply multiple different timezone offsets {sorted(list(offsets))} from the timezone-aware candidate '{aware_cand}'. Cannot infer a unique timezone offset.")
+            return None
+
+    def _validate_aware_against_naive(self, aware_cand: DateTimeCandidate, naive_candidates: List[DateTimeCandidate], context: MergeContext) -> bool:
+        for nc in naive_candidates:
+            # 3.1 If the naive candidate matches the primary candidate's local time, it's fine
+            if abs(nc.representative_value - aware_cand.representative_value.replace(tzinfo=None)) <= timedelta(seconds=30):
+                continue
+            # 3.2 If the naive candidate matches the primary candidate's UTC time, it's also fine
+            elif abs(nc.representative_value - aware_cand.representative_value.astimezone(timezone.utc).replace(tzinfo=None)) <= timedelta(seconds=30):
+                continue
+            else:
+                context.record_conflict(self.date_type, f"The naive datetime candidate '{nc}' does not match the timezone-aware candidate '{aware_cand}' in either local or UTC time (with tolerance of 30 seconds).")
+                return False
+        return True
+
+    def _resolve_with_naive_only(self, context: MergeContext, naive_candidates: List[DateTimeCandidate], inferred_tz: ZoneInfo | None):
+        # 0. There should be at least one naive candidate here
+        if not naive_candidates:
+            return None
+
+        # 1. if only one naive candidate, use it
+        if len(naive_candidates) == 1:
+            single_value = naive_candidates[0].representative_value
             if inferred_tz:
                 single_value = single_value.replace(tzinfo=inferred_tz)
             return single_value
+        # 2. if 2 naive candidates, try to resolve with heuristic
+        elif len(naive_candidates) == 2 and inferred_tz:
+            cand1 = naive_candidates[0]
+            cand2 = naive_candidates[1]
+            return self._handle_naive_pair_with_gps(cand1, cand2, inferred_tz, context)
 
-        unique_naive_values = list(unique_naive_groups.keys())
-        if not inferred_tz or len(unique_naive_values) != 2:
-            conflicting_ids = sorted([s.id for s in naive_sources])
-            msg = (f"Found multiple distinct naive times {sorted(unique_naive_values)}, but cannot resolve them. "
-                   f"Source IDs: {conflicting_ids}")
-            context.record_conflict(self.date_type, msg)
-            return None
-
-        # Heuristic with IDs
-        t1, t2 = unique_naive_values[0], unique_naive_values[1]
-        # We must use a sample datetime to get the offset, as it can depend on DST
-        offset = inferred_tz.utcoffset(t1)
-
-        utc_time = None
-
-        # Possibility 1: t1 is the UTC time and t2 is the local time
-        if t1.replace(tzinfo=timezone.utc).astimezone(inferred_tz).replace(tzinfo=None) == t2:
-            utc_time = t1.replace(tzinfo=timezone.utc)
-
-        # Possibility 2: t2 is the UTC time and t1 is the local time
-        elif t2.replace(tzinfo=timezone.utc).astimezone(inferred_tz).replace(tzinfo=None) == t1:
-            utc_time = t2.replace(tzinfo=timezone.utc)
-
-        if utc_time:
-            final_value = utc_time.astimezone(inferred_tz)
-            return final_value
+        # 3. Conflict
         else:
-            conflicting_ids = sorted([s.id for s in naive_sources])
-            offset = inferred_tz.utcoffset(t1)
-            msg = (f"The difference between naive times '{t1}' and '{t2}' cannot be explained "
-                   f"by the inferred timezone offset ({offset}). Source IDs: {conflicting_ids}")
-            context.record_conflict(self.date_type, msg)
+            context.record_conflict(self.date_type, f"Multiple distinct naive datetime candidates found: {naive_candidates}. Cannot resolve without GPS-inferred timezone.")
             return None
 
-    def _process_with_aware(self, context: MergeContext, aware_sources: list[models.MetadataEntry],
-                            naive_sources: list[models.MetadataEntry],
-                            inferred_tz: ZoneInfo | None):
-        # Group source IDs by their UTC time
-        utc_groups = {}
-        for s in aware_sources:
-            utc_time = s.value_dt.astimezone(timezone.utc)
-            utc_groups.setdefault(utc_time, []).append(s.id)
+    def _handle_naive_pair_with_gps(
+            self,
+            cand1: DateTimeCandidate,
+            cand2: DateTimeCandidate,
+            gps_tz: ZoneInfo,
+            context: MergeContext
+    ) -> datetime | None:
+        """Heuristic: Tries to see if one naive time is UTC and the other is local."""
+        t1, t2 = cand1.representative_value, cand2.representative_value
 
-        # UTC Consistency Check with tolerance
-        if len(utc_groups) > 1:
-            times = sorted(utc_groups.keys())
-            min_time, max_time = times[0], times[-1]
+        # Possibility 1: t1 is UTC, t2 is local
+        if abs(t1.replace(tzinfo=timezone.utc).astimezone(gps_tz).replace(tzinfo=None) - t2) < timedelta(seconds=5):
+            return t1.replace(tzinfo=timezone.utc).astimezone(gps_tz)
 
-            if (max_time - min_time) > timedelta(seconds=2):
-                report = {k.isoformat(): sorted(v) for k, v in utc_groups.items()}
-                msg = f"Timezone-aware datetimes do not agree on the absolute UTC time. Groups: {report}"
-                context.record_conflict(self.date_type, msg)
-                return None
+        # Possibility 2: t2 is UTC, t1 is local
+        if abs(t2.replace(tzinfo=timezone.utc).astimezone(gps_tz).replace(tzinfo=None) - t1) < timedelta(seconds=5):
+            return t2.replace(tzinfo=timezone.utc).astimezone(gps_tz)
 
-        final_utc_time = min(utc_groups.keys())
-        final_value = None
-
-        # Group naive sources by their datetime value to find unique times
-        unique_naive_groups = {}
-        for s in naive_sources:
-            unique_naive_groups.setdefault(s.value_dt, []).append(s.id)
+        context.record_conflict(self.date_type,
+                                f"The difference between naive times '{t1}' and '{t2}' cannot be explained by the GPS-inferred timezone '{gps_tz.key}'.")
+        return None
 
 
-        # Case 1: Resolve using a single unique naive time as the local time reference.
-        # This handles your scenario where aware + naive times can determine the offset.
-        if final_value is None and len(unique_naive_groups) == 1:
-            unique_naive_time = list(unique_naive_groups.keys())[0]
-            offset = unique_naive_time - final_utc_time.replace(tzinfo=None)
+class FallbackDateToGpsDateTimeStep(MergeStep):
+    """
+    Sets both the taken and modified dates to the GPSDateTime if no dates were found
+    and no conflicts occurred during the initial date merges.
+    This step should run AFTER the primary DateTimeAndZoneMergeStep for both 'taken' and 'modified'.
+    """
+    def __init__(self):
+        self.tz_finder = TimezoneFinder()
 
+    def infer_timezone(self, context: MergeContext) -> ZoneInfo | None:
+        lat = context.get_value("gps_latitude")
+        lon = context.get_value("gps_longitude")
+        if lat is None or lon is None:
+            return None
+        tz_name = self.tz_finder.timezone_at(lat=lat, lng=lon)
+        if tz_name is None:
+            return None
+        try:
+            return ZoneInfo(tz_name)
+        except Exception:
+            return None
+
+    def process(self, context: MergeContext):
+        # 1. Check if a 'taken' date has already been successfully merged.
+        if "taken" not in context.finalized_fields and "taken" not in context.conflicts:
             try:
-                # Create a fixed-offset timezone from the calculated difference
-                inferred_tz_from_naive = timezone(offset)
-                final_value = final_utc_time.astimezone(inferred_tz_from_naive)
-            except ValueError:
-                msg = (f"The difference between aware UTC time '{final_utc_time.isoformat()}' and naive time "
-                       f"'{unique_naive_time.isoformat()}' resulted in an invalid timezone offset of '{offset}'.")
-                context.record_conflict(self.date_type, msg)
-                return None
+                gps_datetime_arg = context.get_value("Composite:GPSDateTime", required=True)
+            except RuntimeError:
+                # This should not happen if the pipeline is ordered correctly, but it's a safe check.
+                gps_datetime_arg = None
 
-        # Case 2: No naive times, or conflicting naive times. Fall back to using GPS or original offsets.
-        if final_value is None:
-            if inferred_tz:
-                # Use GPS as the source of truth for the timezone.
-                final_value = final_utc_time.astimezone(inferred_tz)
-            else:
-                # No GPS. Check if original aware sources had a consistent offset.
-                unique_offsets = {s.value_dt.utcoffset() for s in aware_sources}
-                if len(unique_offsets) == 1:
-                    # All aware times have the same offset, so it's safe to use that zone.
-                    final_value = final_utc_time.astimezone(aware_sources[0].value_dt.tzinfo)
-                elif len(unique_offsets) == 2:
-                    # if one of the offsets is zero (UTC), we can still use the other offset
-                    # so check for that case (that one has timedelta of 0, the other does not)
-                    if None in unique_offsets:
-                        unique_offsets.remove(None)
-                    if timedelta(0) in unique_offsets:
-                        unique_offsets.remove(timedelta(0))
-                    if len(unique_offsets) == 1:
-                        final_value = final_utc_time.astimezone(timezone(unique_offsets.pop()))
-                    else:
-                        offsets_repr = sorted([o for o in unique_offsets if o is not None])
-                        msg = (f"Aware datetimes have conflicting offsets ({offsets_repr}), and no GPS or unique naive "
-                               f"time is available to determine the correct local timezone.")
-                        context.record_conflict(self.date_type, msg)
-                        return None
-                elif len(unique_offsets) > 2:
-                    offsets_repr = sorted([o for o in unique_offsets if o is not None])
-                    msg = (f"Aware datetimes have conflicting offsets ({offsets_repr}), and no GPS or unique naive "
-                           f"time is available to determine the correct local timezone.")
-                    context.record_conflict(self.date_type, msg)
-                    return None
+            if gps_datetime_arg and isinstance(gps_datetime_arg, datetime):
+                inferred_tz = self.infer_timezone(context)
+                if inferred_tz:
+                    gps_datetime_arg = gps_datetime_arg.astimezone(inferred_tz)
 
-        # If there were multiple distinct naive times initially, they represent an unresolvable conflict.
-        if len(unique_naive_groups) > 1:
-            conflicting_ids = sorted([s.id for s in naive_sources])
-            msg = (f"Found multiple distinct naive times {sorted(unique_naive_groups.keys())}, creating ambiguity. "
-                   f"While a final value was determined from higher-priority data, this conflict in the source is being noted. Chosen value: {final_value.isoformat()}. "
-                   f"Source IDs: {conflicting_ids}")
-            context.record_conflict(self.date_type, msg)
+                # Create a new ExportArgument for 'taken' using the value from 'Composite:GPSDateTime'.
+                taken_arg = DateTimeArgument(gps_datetime_arg, "taken")
 
-        if final_value is not None:
-            return final_value
-        else:
-            return None
+                # Set the final value for 'taken' in the context.
+                context.set_value("taken", taken_arg)
 
 
 class FallbackModifiedDateStep(MergeStep):
@@ -659,6 +808,7 @@ class MergePipeline:
             BasicFieldMergeStep("Composite:GPSDateTime"),
             DateTimeAndZoneMergeStep("taken"),
             DateTimeAndZoneMergeStep("modified"),
+            FallbackDateToGpsDateTimeStep(),
             FallbackModifiedDateStep(),
         ]
         return cls(steps)

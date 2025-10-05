@@ -176,3 +176,14 @@ class MetadataEntry(Base):
     value_real = Column(REAL)
 
     source_info = relationship("MetadataSource", back_populates="entries")
+
+    @property
+    def value(self) -> str | datetime.datetime | float | None:
+        """Returns the value in its appropriate type."""
+        if self.value_str is not None:
+            return self.value_str
+        if self.value_dt is not None:
+            return self.value_dt
+        if self.value_real is not None:
+            return self.value_real
+        return None
