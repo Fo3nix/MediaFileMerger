@@ -138,6 +138,7 @@ class MediaOwnership(Base):
     id = Column(Integer, primary_key=True, index=True)
     owner_id = Column(Integer, ForeignKey('owners.id'), nullable=False)
     location_id = Column(Integer, ForeignKey('locations.id'), nullable=False)
+    suggested_export_path = Column(String, nullable=True)
 
     owner = relationship("Owner", back_populates="locations")
     location = relationship("Location", back_populates="owners")

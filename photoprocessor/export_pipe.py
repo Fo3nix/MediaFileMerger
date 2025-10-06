@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import logging
 from datetime import datetime, timezone
+from fileinput import filename
 from typing import List, Dict, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor
 import sys
@@ -42,9 +43,12 @@ def get_locations_for_owner(db: Session, owner: models.Owner) -> List[models.Loc
         models.MediaOwnership.owner_id == owner.id
     ).options(
         selectinload(models.MediaOwnership.location).selectinload(models.Location.media_file).options(
-            # This is the full chain to load everything needed for the property
-            selectinload(models.MediaFile.locations).selectinload(models.Location.metadata_sources).selectinload(
-                models.MetadataSource.entries)
+            # This is the full chain to load everything needed
+            selectinload(models.MediaFile.locations).options(
+                selectinload(models.Location.owners),  # <-- ADD THIS LINE
+                selectinload(models.Location.metadata_sources).selectinload(
+                    models.MetadataSource.entries)
+            )
         )
     ).all()
     return [record.location for record in ownership_records]
@@ -57,9 +61,12 @@ def get_locations_by_paths(db: Session, paths: List[str]) -> List[models.Locatio
         models.Location.path.in_(paths)
     ).options(
         selectinload(models.Location.media_file).options(
-            # This is the full chain to load everything needed for the property
-            selectinload(models.MediaFile.locations).selectinload(models.Location.metadata_entries).selectinload(
-                models.MetadataSource.entries)
+            # This is the full chain to load everything needed
+            selectinload(models.MediaFile.locations).options(
+                selectinload(models.Location.owners),  # <-- ADD THIS LINE
+                selectinload(models.Location.metadata_entries).selectinload(
+                    models.MetadataSource.entries)
+            )
         )
     ).all()
 
@@ -129,12 +136,33 @@ def log_conflict(logger: logging.Logger, file_path: str, conflicts: Dict[str, Li
     logger.warning(f"{file_path}\n    {details_str}")
 
 
-def generate_relative_export_path(media_file: models.MediaFile, export_arguments: List[ExportArgument]) -> str:
+def generate_relative_export_path(media_file: models.MediaFile, export_arguments: List[ExportArgument], owner: models.Owner) -> str:
     """
     Generates the full relative export path for a media file based on a prioritized
     set of rules, falling back to a year-based structure using the merged metadata.
     """
+
     filename = media_file.locations[0].filename
+
+    ### --- First Priority: Check for User-Suggested Export Path --- ###
+    ownerships = [
+        mo for loc in media_file.locations
+        for mo in loc.owners
+        if mo.owner_id == owner.id and mo.suggested_export_path is not None
+    ]
+    unique_suggestions = set(mo.suggested_export_path for mo in ownerships if mo.suggested_export_path)
+    if unique_suggestions:
+        target_subdir = ""
+        if len(unique_suggestions) == 1:
+            target_subdir = unique_suggestions.pop()
+        else:
+            sanitized_paths = sorted([p.replace(os.sep, '-') for p in unique_suggestions if p])
+            target_subdir = '--'.join(sanitized_paths)
+
+        return os.path.join(target_subdir, filename)
+
+
+    ### --- Second Priority: Check for Known Folder Patterns in Any Location Path --- ###
 
     # --- DEFINE YOUR FOLDER HIERARCHY HERE ---
     priority_rules = [
@@ -196,7 +224,8 @@ def process_export_batch(
         logger: logging.Logger,
         conflict_fp,
         pipeline: MergePipeline,
-        processed_media_ids: set
+        processed_media_ids: set,
+        owner: models.Owner
 ) -> Dict[str, Any]:
     """Processes a single batch of files: merge, parallel copy, and batch metadata write."""
     stats = {"exported": 0, "skipped": 0, "conflicts": 0}
@@ -245,7 +274,7 @@ def process_export_batch(
             continue
 
         # Pass the raw merged_data dict for path generation, as it contains simple values.
-        relative_path = generate_relative_export_path(loc.media_file, final_arguments)
+        relative_path = generate_relative_export_path(loc.media_file, final_arguments, owner)
         output_path = os.path.join(export_dir, relative_path)
 
         output_dir_for_file = os.path.dirname(output_path)
@@ -349,7 +378,7 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
                 for i in range(0, total_files, CONFIG["BATCH_SIZE"]):
                     batch = locations_to_export[i:i + CONFIG["BATCH_SIZE"]]
                     batch_size_bytes = sum(loc.file_size for loc in batch)
-                    stats = process_export_batch(batch, export_dir, conflict_dir, executor, conflict_logger, conflict_fp, export_merge_pipeline, processed_media_ids)
+                    stats = process_export_batch(batch, export_dir, conflict_dir, executor, conflict_logger, conflict_fp, export_merge_pipeline, processed_media_ids, owner)
                     for key in total_stats:
                         total_stats[key] += stats[key]
                     pbar.update(batch_size_bytes)
@@ -369,7 +398,7 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export media files with merged metadata from a database.")
     parser.add_argument("export_dir", type=str, help="The target directory for the export.")
-    parser.add_argument("--owner", type=str, help="The name of the owner whose files to export.")
+    parser.add_argument("--owner", type=str, help="The name of the owner whose files to export.", required=True)
     parser.add_argument("--filelist", "-f", type=str,
                         help="Optional path to a file with absolute file paths to export.")
 
