@@ -216,6 +216,29 @@ def generate_relative_export_path(media_file: models.MediaFile, export_arguments
     return os.path.join("Unknown_Date", filename)
 
 
+def find_unique_filepath(destination_path: str) -> str:
+    """
+    Checks if a file exists at the destination. If so, it appends a number
+    like '-[1]' to the filename until a unique path is found.
+    """
+    if not os.path.exists(destination_path):
+        return destination_path  # The original path is already unique
+
+    directory = os.path.dirname(destination_path)
+    filename = os.path.basename(destination_path)
+    base_name, extension = os.path.splitext(filename)
+
+    counter = 1
+    while True:
+        # Create a new filename, e.g., "my_photo-[1].jpg"
+        new_filename = f"{base_name}-[{counter}]{extension}"
+        new_path = os.path.join(directory, new_filename)
+
+        if not os.path.exists(new_path):
+            return new_path  # Found a unique path
+
+        counter += 1
+
 def process_export_batch(
         batch_locations: List[models.Location],
         export_dir: str,
@@ -261,6 +284,7 @@ def process_export_batch(
 
         # Get the final arguments. This also runs the conflict check internally.
         final_arguments = result_context.get_all_arguments()
+        relative_path = generate_relative_export_path(loc.media_file, final_arguments, owner)
 
         # Check for any conflicts recorded during the merge process OR by the argument validation.
         if result_context.conflicts:
@@ -268,24 +292,22 @@ def process_export_batch(
             log_conflict(logger, loc.path, result_context.conflicts)
             conflict_fp.write(f"{loc.path}\n")
             conflict_fp.flush()
-            conflict_output_path = os.path.join(conflict_dir, loc.filename)
-            if not os.path.exists(conflict_output_path):
-                files_to_copy_conflict.append((loc.path, conflict_output_path))
+            initial_conflict_path = os.path.join(conflict_dir, relative_path)
+            unique_conflict_path = find_unique_filepath(initial_conflict_path)
+
+            os.makedirs(os.path.dirname(unique_conflict_path), exist_ok=True)
+            files_to_copy_conflict.append((source_loc_to_copy.path, unique_conflict_path))
             continue
 
         # Pass the raw merged_data dict for path generation, as it contains simple values.
-        relative_path = generate_relative_export_path(loc.media_file, final_arguments, owner)
-        output_path = os.path.join(export_dir, relative_path)
+        initial_output_path = os.path.join(export_dir, relative_path)
+        unique_output_path = find_unique_filepath(initial_output_path)
 
-        output_dir_for_file = os.path.dirname(output_path)
+        output_dir_for_file = os.path.dirname(unique_output_path)
         os.makedirs(output_dir_for_file, exist_ok=True)
 
-        if os.path.exists(output_path):
-            stats["skipped"] += 1
-            continue
-
-        files_to_copy.append((source_loc_to_copy.path, output_path))
-        files_for_metadata.append((output_path, final_arguments))
+        files_to_copy.append((source_loc_to_copy.path, unique_output_path))
+        files_for_metadata.append((unique_output_path, final_arguments))
         processed_media_ids.add(loc.media_file.id)
 
     if files_to_copy:
