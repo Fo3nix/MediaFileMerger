@@ -543,7 +543,11 @@ class DateTimeAndZoneMergeStep(MergeStep):
         lon = context.get_value("gps_longitude")
         if lat is None or lon is None:
             return None
-        tz_name = self.tz_finder.timezone_at(lat=lat, lng=lon)
+        # check wi
+        try:
+            tz_name = self.tz_finder.timezone_at(lat=lat, lng=lon)
+        except Exception:
+            return None
         if tz_name is None:
             return None
         try:
@@ -584,8 +588,20 @@ class DateTimeAndZoneMergeStep(MergeStep):
             context.record_conflict(self.date_type, "No timezone-aware datetime candidates available for resolution.")
             return None
 
-        # 1. if multiple aware candidates, conflict, as these should have been merged already
-        if len(aware_candidates) > 1:
+        # 1 if multiple aware candidates,
+        # 1.1 if len == 2 and one is UTC and the other is not, prefer the non-UTC one
+        # 1.2 if len > 2, conflict, as these should have been merged already
+        if len(aware_candidates) == 2:
+            utc_candidates = [c for c in aware_candidates if c.representative_value.tzinfo is timezone.utc]
+            non_utc_candidates = [c for c in aware_candidates if c.representative_value.tzinfo is not timezone.utc]
+
+            if len(utc_candidates) == 1 and len(non_utc_candidates) == 1:
+                # Prefer the non-UTC candidate
+                aware_candidates = non_utc_candidates
+            else:
+                context.record_conflict(self.date_type, f"Multiple distinct timezone-aware datetime candidates found: {aware_candidates}")
+                return None
+        elif len(aware_candidates) > 2:
             context.record_conflict(self.date_type, f"Multiple distinct timezone-aware datetime candidates found: {aware_candidates}")
             return None
 
@@ -604,8 +620,27 @@ class DateTimeAndZoneMergeStep(MergeStep):
                 primary_candidate.representative_value = primary_candidate.representative_value.astimezone(inferred_tz)
                 primary_candidate_timezone_assumed_utc = False
             else:
-                if primary_candidate.representative_value.tzinfo != inferred_tz:
-                    context.record_conflict(self.date_type, f"The timezone-aware datetime candidate '{primary_candidate}' has a different timezone than the GPS-inferred timezone '{inferred_tz.key}'.")
+                # Get the actual UTC offset from the candidate's datetime object.
+                actual_offset = primary_candidate.representative_value.utcoffset()
+                # Calculate the expected UTC offset using the inferred ZoneInfo object for that specific datetime.
+                # This correctly handles historical dates and Daylight Saving Time.
+                expected_offset = inferred_tz.utcoffset(primary_candidate.representative_value)
+
+                # if difference of 2 hours, trust the actual timezone
+                if actual_offset and expected_offset and abs((actual_offset - expected_offset).total_seconds()) <= 7200:
+                    # primary_candidate.representative_value = primary_candidate.representative_value.astimezone(inferred_tz)
+                    pass
+                # if primary_candidate is in UTC and expected_offset is not zero, convert to inferred timezone
+                elif primary_candidate.representative_value.tzinfo is timezone.utc and expected_offset != timedelta(0):
+                    primary_candidate.representative_value = primary_candidate.representative_value.astimezone(inferred_tz)
+                # If the offsets do not match, record a conflict
+                elif actual_offset != expected_offset:
+                    # The conflict message is now more informative, showing the exact offsets.
+                    context.record_conflict(
+                        self.date_type,
+                        f"The timezone-aware datetime candidate '{primary_candidate.representative_value.isoformat()}' has a UTC offset of {actual_offset}, "
+                        f"which conflicts with the GPS-inferred offset of {expected_offset} for that date and time (in timezone '{inferred_tz.key}')."
+                    )
                     return None
 
         # 3. If there are no naive candidates, we can return the primary candidate as is
@@ -614,15 +649,23 @@ class DateTimeAndZoneMergeStep(MergeStep):
 
         # 4. If primary timezone is still assumed to be UTC, we can try to infer the offset from naive candidates
         #    If not, we need to validate the naive candidates against the primary candidate's local and utc time
-        if primary_candidate_timezone_assumed_utc:
-            offset = self._infer_timezone_offset_from_naive_candidates(primary_candidate, naive_candidates, context)
+        filtered_naive_candidates = [nc for nc in naive_candidates if
+                                     not nc.source_keys.issubset({"exiftool:SourceFile", "google:title"})]
+        if primary_candidate_timezone_assumed_utc and filtered_naive_candidates:
+
+            offset = self._infer_timezone_offset_from_naive_candidates(primary_candidate, filtered_naive_candidates, context)
+
+            # print it if offset is between xx:05 and xx:55
+            if offset and 3600 > (offset.total_seconds() % 3600) > 0:
+                print('Interesting offset inferred:', offset, 'from', filtered_naive_candidates, 'and', primary_candidate)
 
             if offset:
                 tz = timezone(offset)
+
                 primary_candidate.representative_value = primary_candidate.representative_value.astimezone(tz)
             else:
                 return None
-        else:
+        elif not primary_candidate_timezone_assumed_utc:
             if not self._validate_aware_against_naive(primary_candidate, naive_candidates, context):
                 return None
 
@@ -643,35 +686,68 @@ class DateTimeAndZoneMergeStep(MergeStep):
                 return None
 
             # offset, amount of seconds shy of a whole 15 minutes
-            offset_dist_from_quarter_hour = abs(offset.total_seconds() % 900)
+            offset_dist_from_quarter_hour = abs(offset.total_seconds() % 1800)
 
-            if 60 <offset_dist_from_quarter_hour < 830:
-                context.record_conflict(self.date_type, f"The naive datetime candidate '{nc}' implies a timezone offset of {offset} from the timezone-aware candidate '{aware_cand}', which is not a whole number of 15-minute increments (with a tolerance of 1 minute).")
+            if 60 < offset_dist_from_quarter_hour < 1740:
+                context.record_conflict(self.date_type, f"The naive datetime candidate '{nc}' implies a timezone offset of {offset} from the timezone-aware candidate '{aware_cand}', which is not a whole number of 30-minute increments (with a tolerance of 1 minute).")
                 return None
 
             # round to nearest 15 minutes
-            if offset_dist_from_quarter_hour <= 60:
+            if offset_dist_from_quarter_hour <= 900:
                 offset -= timedelta(seconds=offset_dist_from_quarter_hour)
-            elif offset_dist_from_quarter_hour >= 830:
-                offset += timedelta(seconds=(900 - offset_dist_from_quarter_hour))
+            elif offset_dist_from_quarter_hour >= 900:
+                offset += timedelta(seconds=(1800 - offset_dist_from_quarter_hour))
 
             offsets.add(offset)
+
         if len(offsets) == 1:
+            return offsets.pop()
+        elif len(offsets) == 2 and timedelta(0) in offsets:
+            offsets.remove(timedelta(0))
             return offsets.pop()
         else:
             context.record_conflict(self.date_type, f"The naive datetime candidates {naive_candidates} imply multiple different timezone offsets {sorted(list(offsets))} from the timezone-aware candidate '{aware_cand}'. Cannot infer a unique timezone offset.")
             return None
 
     def _validate_aware_against_naive(self, aware_cand: DateTimeCandidate, naive_candidates: List[DateTimeCandidate], context: MergeContext) -> bool:
+        # if aware_cand contains source key google:photoTakenTime
+        if "google:photoTakenTime" in aware_cand.source_keys:
+            # if each naive candidate has one source key starting with 'EXIF' or 'XMP'
+            if all(any(k.startswith("EXIF") or k.startswith("XMP") for k in nc.source_keys) for nc in naive_candidates):
+                # if the difference between each naive candidate and the aware candidate's utc time is less than 24 hours
+                if all(abs(nc.representative_value - aware_cand.representative_value.astimezone(tz=timezone.utc).replace(tzinfo=None)) <= timedelta(hours=24) for nc in naive_candidates):
+                    # ASSUME GOOGLE PHOTOS TIME WAS DELIBERATELY EDITED BY THE USER
+                    return True
+
+        skip_nc_candidate = None
         for nc in naive_candidates:
+            # if {"exiftool:SourceFile", "google:title"} is the full set, or contains either of these keys of naive candidate and aware candidate contains EXIF or XMP key
+            if (nc.source_keys.issubset({"exiftool:SourceFile", "google:title"})
+                and any(
+                    (isinstance(k, str) and k.startswith(('EXIF', 'XMP', 'google:photoTakenTime')))
+                    or
+                    (isinstance(k, tuple) and any(s.startswith(('EXIF', 'XMP')) for s in k))
+                    for k in aware_cand.source_keys
+                )
+            ):
+                # if the difference between the naive candidate and the aware candidate's utc time is less than 24 hours
+                if abs(nc.representative_value - aware_cand.representative_value.astimezone(tz=timezone.utc).replace(tzinfo=None)) <= timedelta(hours=24):
+                    # WE ASSUME EVERYTHING IS FINE. THE DATE IS 'CLOSE ENOUGH' AND THE FILE CONTENTS ARE GOOD ENOUGH
+                    skip_nc_candidate = nc
+
+
+
+        for nc in naive_candidates:
+            if nc == skip_nc_candidate:
+                continue
             # 3.1 If the naive candidate matches the primary candidate's local time, it's fine
-            if abs(nc.representative_value - aware_cand.representative_value.replace(tzinfo=None)) <= timedelta(seconds=30):
+            if abs(nc.representative_value - aware_cand.representative_value.replace(tzinfo=None)) <= timedelta(seconds=60):
                 continue
             # 3.2 If the naive candidate matches the primary candidate's UTC time, it's also fine
-            elif abs(nc.representative_value - aware_cand.representative_value.astimezone(timezone.utc).replace(tzinfo=None)) <= timedelta(seconds=30):
+            elif abs(nc.representative_value - aware_cand.representative_value.astimezone(timezone.utc).replace(tzinfo=None)) <= timedelta(seconds=60):
                 continue
             else:
-                context.record_conflict(self.date_type, f"The naive datetime candidate '{nc}' does not match the timezone-aware candidate '{aware_cand}' in either local or UTC time (with tolerance of 30 seconds).")
+                context.record_conflict(self.date_type, f"The naive datetime candidate '{nc}' does not match the timezone-aware candidate '{aware_cand}' in either local or UTC time (with tolerance of 60 seconds).")
                 return False
         return True
 
