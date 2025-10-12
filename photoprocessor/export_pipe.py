@@ -3,6 +3,7 @@ import argparse
 import shutil
 import subprocess
 import logging
+import time
 from datetime import datetime, timezone
 from fileinput import filename
 from typing import List, Dict, Tuple, Any
@@ -83,12 +84,18 @@ def _generate_exiftool_args_for_file(export_arguments: List[ExportArgument]) -> 
 
 
 def write_metadata_batch(files_to_process: List[Tuple[str, List[ExportArgument]]]):
-    """Writes metadata to a batch of files using a single ExifTool command."""
+    """
+    Writes metadata using a hybrid batch approach.
+    Tries to write all metadata in a single ExifTool command for performance.
+    If the batch fails, it falls back to processing files individually to
+    isolate the error and save metadata for the successful files.
+    """
     if not files_to_process:
         return
+
+    # --- Stage 1: Try the fast batch method first ---
     base_args = [CONFIG["EXIFTOOL_PATH"], "-overwrite_original", "-common_args"]
     command_args = []
-
     for output_path, export_args in files_to_process:
         if not export_args:
             continue
@@ -101,22 +108,61 @@ def write_metadata_batch(files_to_process: List[Tuple[str, List[ExportArgument]]
     if not command_args:
         return
 
-    final_args = base_args + command_args[:-1]
+    # Remove the trailing '-execute' for the final command
+    final_batch_args = base_args + command_args[:-1]
     try:
-        subprocess.run(final_args, check=True, capture_output=True, text=True, encoding='utf-8')
+        subprocess.run(final_batch_args, check=True, capture_output=True, text=True, encoding='utf-8')
+        return  # If this succeeds, the function is done!
     except subprocess.CalledProcessError as e:
-        print(
-            f"\n--- ExifTool Batch Error ---\nError applying metadata to a batch of files.\nError: {e.stderr}\n--------------------------")
-        raise
+        print(f"\n--- ExifTool Batch Failed. Falling back to individual processing. ---")
+        print(f"Original Batch Error: {e.stderr.strip()}")
+        print("----------------------------------------------------------------------")
+
+    # --- Stage 2: Fallback to processing files individually ---
+    base_individual_args = [CONFIG["EXIFTOOL_PATH"], "-overwrite_original"]
+    for output_path, export_args in files_to_process:
+        if not export_args:
+            continue
+
+        file_specific_args = _generate_exiftool_args_for_file(export_args)
+        if not file_specific_args:
+            continue
+
+        final_individual_args = base_individual_args + file_specific_args + [output_path]
+        try:
+            subprocess.run(final_individual_args, check=True, capture_output=True, text=True, encoding='utf-8')
+        except subprocess.CalledProcessError as individual_e:
+            # A single file failed. Log it and continue with the rest of the batch.
+            print(f"\n--- Individual ExifTool Error ---")
+            print(f"Failed to apply metadata to: {os.path.basename(output_path)}")
+            print(f"Error: {individual_e.stderr.strip()}")
+            print("---------------------------------")
 
 
 def copy_file_task(src_dst_tuple: Tuple[str, str]):
-    """Simple wrapper for shutil.copy2 for use with ThreadPoolExecutor."""
-    try:
-        shutil.copy2(*src_dst_tuple)
-    except Exception as e:
-        return src_dst_tuple[0], e
-    return src_dst_tuple[0], None
+    """
+    Simple wrapper for shutil.copyfile with a retry mechanism for file locks.
+    """
+    src, dst = src_dst_tuple
+    retries = 3
+    delay = 2  # seconds
+
+    for attempt in range(retries):
+        try:
+            shutil.copyfile(src, dst)
+            return src, None  # Success!
+        except OSError as e:
+            # On Windows, error 32 is "The process cannot access the file..."
+            if hasattr(e, 'winerror') and e.winerror == 32:
+                if attempt < retries - 1:
+                    # If it's the specific lock error and not the last attempt, wait and retry.
+                    time.sleep(delay)
+                    continue
+            # If it's a different OS error or the last attempt, return the error.
+            return src, e
+        except Exception as e:
+            # Catch any other unexpected copy errors
+            return src, e
 
 
 def log_conflict(logger: logging.Logger, file_path: str, conflicts: Dict[str, List[str]]):
