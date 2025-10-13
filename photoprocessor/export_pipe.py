@@ -10,6 +10,8 @@ from typing import List, Dict, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor
 import sys
 import re
+import tempfile
+import contextlib
 
 from tqdm import tqdm
 from sqlalchemy.orm import Session, selectinload
@@ -83,7 +85,7 @@ def _generate_exiftool_args_for_file(export_arguments: List[ExportArgument]) -> 
     return args
 
 
-def write_metadata_batch(files_to_process: List[Tuple[str, List[ExportArgument]]]):
+def write_metadata_batch(files_to_process: List[Tuple[str, str, List[ExportArgument]]]) -> int:
     """
     Writes metadata using a hybrid batch approach.
     Tries to write all metadata in a single ExifTool command for performance.
@@ -91,36 +93,40 @@ def write_metadata_batch(files_to_process: List[Tuple[str, List[ExportArgument]]
     isolate the error and save metadata for the successful files.
     """
     if not files_to_process:
-        return
+        return 0
+
+    processed_in_batch = 0
 
     # --- Stage 1: Try the fast batch method first ---
-    base_args = [CONFIG["EXIFTOOL_PATH"], "-overwrite_original", "-common_args"]
+    base_args = [CONFIG["EXIFTOOL_PATH"], "-common_args"]
     command_args = []
-    for output_path, export_args in files_to_process:
+    for source_path, output_path, export_args in files_to_process:
         if not export_args:
             continue
         file_args = _generate_exiftool_args_for_file(export_args)
         if file_args:
             command_args.extend(file_args)
-            command_args.append(output_path)
+            command_args.extend(["-o", output_path, source_path])
             command_args.append("-execute")
+            processed_in_batch += 1
 
     if not command_args:
-        return
+        return 0
 
     # Remove the trailing '-execute' for the final command
     final_batch_args = base_args + command_args[:-1]
     try:
         subprocess.run(final_batch_args, check=True, capture_output=True, text=True, encoding='utf-8')
-        return  # If this succeeds, the function is done!
+        return processed_in_batch
     except subprocess.CalledProcessError as e:
         print(f"\n--- ExifTool Batch Failed. Falling back to individual processing. ---")
         print(f"Original Batch Error: {e.stderr.strip()}")
         print("----------------------------------------------------------------------")
 
     # --- Stage 2: Fallback to processing files individually ---
-    base_individual_args = [CONFIG["EXIFTOOL_PATH"], "-overwrite_original"]
-    for output_path, export_args in files_to_process:
+    successful_count = 0
+    base_individual_args = [CONFIG["EXIFTOOL_PATH"]]
+    for source_path, output_path, export_args in files_to_process:
         if not export_args:
             continue
 
@@ -128,15 +134,18 @@ def write_metadata_batch(files_to_process: List[Tuple[str, List[ExportArgument]]
         if not file_specific_args:
             continue
 
-        final_individual_args = base_individual_args + file_specific_args + [output_path]
+        final_individual_args = base_individual_args + file_specific_args + ["-o", output_path, source_path]
         try:
             subprocess.run(final_individual_args, check=True, capture_output=True, text=True, encoding='utf-8')
+            successful_count += 1
         except subprocess.CalledProcessError as individual_e:
             # A single file failed. Log it and continue with the rest of the batch.
             print(f"\n--- Individual ExifTool Error ---")
             print(f"Failed to apply metadata to: {os.path.basename(output_path)}")
             print(f"Error: {individual_e.stderr.strip()}")
             print("---------------------------------")
+
+    return successful_count
 
 
 def copy_file_task(src_dst_tuple: Tuple[str, str]):
@@ -297,10 +306,9 @@ def process_export_batch(
         owner: models.Owner
 ) -> Dict[str, Any]:
     """Processes a single batch of files: merge, parallel copy, and batch metadata write."""
-    stats = {"exported": 0, "skipped": 0, "conflicts": 0}
-    files_to_copy = []
+    stats = {"exported": 0, "skipped": 0, "conflicts": 0, "failed": 0}
     files_to_copy_conflict = []
-    files_for_metadata: List[Tuple[str, List[ExportArgument]]] = []
+    files_for_metadata: List[Tuple[str, str, List[ExportArgument]]] = []
 
     for loc in batch_locations:
         if loc.media_file.id in processed_media_ids:
@@ -324,6 +332,7 @@ def process_export_batch(
         all_sources_for_file = [source for location in loc.media_file.locations for source in location.metadata_sources]
         if not all_sources_for_file:
             stats["skipped"] += 1
+            print(f"\n⚠️  Skipping file with no metadata sources: {loc.path}")
             continue
 
         result_context = pipeline.run(all_sources_for_file)
@@ -348,31 +357,29 @@ def process_export_batch(
         # Pass the raw merged_data dict for path generation, as it contains simple values.
         initial_output_path = os.path.join(export_dir, relative_path)
         unique_output_path = find_unique_filepath(initial_output_path)
-
         output_dir_for_file = os.path.dirname(unique_output_path)
         os.makedirs(output_dir_for_file, exist_ok=True)
 
-        files_to_copy.append((source_loc_to_copy.path, unique_output_path))
-        files_for_metadata.append((unique_output_path, final_arguments))
+        # Prepare the tuple for the single exiftool command
+        files_for_metadata.append((source_loc_to_copy.path, unique_output_path, final_arguments))
         processed_media_ids.add(loc.media_file.id)
-
-    if files_to_copy:
-        copy_results = executor.map(copy_file_task, files_to_copy)
-        for src, error in copy_results:
-            if error:
-                print(f"\nError copying {src}: {error}")
-            else:
-                stats["exported"] += 1
 
     if files_to_copy_conflict:
         # We just need to execute the copy, we already counted the conflicts
-        for src, error in executor.map(copy_file_task, files_to_copy_conflict):
-            if error:
-                print(f"\nError copying conflicted file {src}: {error}")
-
+        # for src, error in executor.map(copy_file_task, files_to_copy_conflict):
+        #     if error:
+        #         print(f"\nError copying conflicted file {src}: {error}")
+        for src, dst in files_to_copy_conflict:
+            try:
+                copy_file_task((src,dst))
+            except Exception as e:
+                stats["failed"] += 1
+                print(f"\nError copying conflicted file {src} to {dst}: {e}")
     if files_for_metadata:
         try:
-            write_metadata_batch(files_for_metadata)
+            exported_count = write_metadata_batch(files_for_metadata)
+            stats["exported"] += exported_count
+            stats["failed"] += len(files_for_metadata) - exported_count
         except Exception as e:
             print(f"\nMetadata batch write failed: {e}")
     return stats
@@ -451,7 +458,7 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
                         total_stats[key] += stats[key]
                     pbar.update(batch_size_bytes)
                     pbar.set_postfix(exported=total_stats['exported'], skipped=total_stats['skipped'],
-                                     conflicts=total_stats['conflicts'])
+                                     conflicts=total_stats['conflicts'], failed=stats['failed'])
     finally:
         print("\n--- Export Complete ---")
         print(f"✅ Successfully exported {total_stats['exported']} new files.")
