@@ -102,8 +102,9 @@ class BasicFieldMergeStep(MergeStep):
     Detects conflicts if subsequent sources have different, non-None values.
     """
 
-    def __init__(self, key: str):
+    def __init__(self, key: str, generate_argument: bool = True):
         self.key = key
+        self.generate_argument = generate_argument  # Whether to wrap the final value in a SimpleArgument
 
     def process(self, context: MergeContext):
         # Filter sources by the key we are interested in
@@ -119,9 +120,39 @@ class BasicFieldMergeStep(MergeStep):
             return  # No values to merge
 
         if len(potential_values) == 1:
-            context.set_value(self.key, potential_values.pop())
+            if self.generate_argument:
+                context.set_value(self.key, SimpleArgument(self.key, potential_values.pop()))
+            else:
+                context.set_value(self.key, potential_values.pop())
         else:
             context.record_conflict(self.key, f"Conflicting values: {sorted(list(potential_values), key=str)}. Entry IDs: {[s.id for s in relevant_entries if (s.value_str or s.value_dt or s.value_real) in potential_values]}")
+
+class GPSDateTimeMergeStep(MergeStep):
+    def process(self, context: MergeContext):
+        # process a BasicFieldMergestep for Composite:GPSDateTime, without creation of an argument
+        step = BasicFieldMergeStep("Composite:GPSDateTime", generate_argument=False)
+        step.process(context)
+
+        # check no conflicts
+        if "Composite:GPSDateTime" in context.conflicts:
+            context.record_conflict("gps_datetime", f"[GPSDateTime Conflict] {context.conflicts['Composite:GPSDateTime'][0]}")
+            return
+
+        gps_datetime = context.get_value("Composite:GPSDateTime")
+        if gps_datetime is None:
+            return
+
+        if not isinstance(gps_datetime, datetime):
+            context.record_conflict("gps_datetime", f"Invalid GPSDateTime value type: {type(gps_datetime)}")
+            return
+
+        date_str = gps_datetime.strftime('%Y:%m:%d')
+        time_str = gps_datetime.strftime('%H:%M:%S')
+
+        context.set_value("GPSDateStamp", SimpleArgument("GPSDateStamp", date_str))
+        context.set_value("GPSTimeStamp", SimpleArgument("GPSTimeStamp", time_str))
+
+
 
 
 class GPSMergeStep(MergeStep):
@@ -837,7 +868,41 @@ class FallbackDateToGpsDateTimeStep(MergeStep):
 
                 # Set the final value for 'taken' in the context.
                 context.set_value("taken", taken_arg)
+                print(f"Fallback: Set 'taken' to GPSDateTime {gps_datetime_arg.isoformat()} with timezone {inferred_tz.key if inferred_tz else 'None'}")
 
+
+class FallbackDateTimeStep(MergeStep):
+    """
+    A generic fallback step that sets a field to a specified fallback value if no value was found
+    and no conflicts occurred during the initial merge.
+    """
+    def __init__(self, field_name: str, fallback_key: str):
+        self.field_name = field_name
+        self.fallback_key = fallback_key
+
+    def process(self, context: MergeContext):
+        # 1. Check if the target field has already been successfully merged.
+        if self.field_name in context.finalized_fields:
+            return  # A value already exists, so do nothing.
+
+        # 2. Check if the original field recorded a conflict.
+        if self.field_name in context.conflicts:
+            return  # There was a conflict, so we should not apply a fallback.
+
+        # 3. If we proceed, it means the target field is empty and conflict-free.
+        #    Try to get the fallback value, which should have been finalized by a previous step.
+        try:
+            fallback_arg = context.get_value(self.fallback_key, required=True)
+        except RuntimeError:
+            # This should not happen if the pipeline is ordered correctly, but it's a safe check.
+            return
+
+        if fallback_arg:
+            fallback_value = fallback_arg.value if isinstance(fallback_arg, DateTimeArgument) else fallback_arg
+
+            target_arg = DateTimeArgument(fallback_value, self.field_name)
+            # Set the final value for the target field in the context.
+            context.set_value(self.field_name, target_arg)
 
 class FallbackModifiedDateStep(MergeStep):
     """
@@ -862,11 +927,10 @@ class FallbackModifiedDateStep(MergeStep):
             # This should not happen if the pipeline is ordered correctly, but it's a safe check.
             return
 
-        if taken_date_arg and isinstance(taken_date_arg, DateTimeArgument):
-            # Create a new ExportArgument for 'modified' using the value from 'taken'.
-            fallback_value = taken_date_arg.value
-            modified_arg = DateTimeArgument(fallback_value, "modified")
+        if taken_date_arg:
+            fallback_value = taken_date_arg.value if isinstance(taken_date_arg, DateTimeArgument) else taken_date_arg
 
+            modified_arg = DateTimeArgument(fallback_value, "modified")
             # Set the final value for 'modified' in the context.
             context.set_value("modified", modified_arg)
 
@@ -880,11 +944,12 @@ class MergePipeline:
     def get_default_pipeline(cls) -> 'MergePipeline':
         steps: List[MergeStep] = [
             GPSMergeStep(),
-            BasicFieldMergeStep("Composite:GPSDateTime"),
+            GPSDateTimeMergeStep(),
             DateTimeAndZoneMergeStep("taken"),
             DateTimeAndZoneMergeStep("modified"),
             FallbackDateToGpsDateTimeStep(),
-            FallbackModifiedDateStep(),
+            FallbackDateTimeStep("modified", "taken"),
+            FallbackDateTimeStep("taken", "modified"),
         ]
         return cls(steps)
 

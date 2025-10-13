@@ -1,7 +1,7 @@
 # In a new file, e.g., photoprocessor/export_arguments.py
 import abc
 from datetime import datetime, timezone
-from typing import List, Set
+from typing import List, Set, Any
 
 
 class ExportArgument(abc.ABC):
@@ -24,17 +24,32 @@ class ExportArgument(abc.ABC):
 class SimpleArgument(ExportArgument):
     """Handles simple key-value pairs."""
 
-    def __init__(self, tag: str, value: str):
+    def __init__(self, tag: str, value: Any):
         super().__init__(value)
         self.tag = tag
 
     def build(self) -> List[str]:
-        if not self.value:
+        if self.value is None:
             return []
-        return [f"-{self.tag}={self.value}"]
+
+
+        value_str = self.value_str()
+
+        return [f"-{self.tag}={value_str}"]
 
     def get_managed_tags(self) -> Set[str]:
         return {f"-{self.tag}"}
+
+    def value_str(self) -> str:
+        if isinstance(self.value, datetime):
+            # format like '%Y:%m:%d %H:%M:%S' if has no timezone, else '%Y:%m:%d %H:%M:%S%z' if timezone aware
+            timezone_str = ""
+            if self.value.tzinfo:
+                offset = self.value.strftime('%z')
+                timezone_str = offset[:3] + ':' + offset[3:]
+
+            return self.value.strftime('%Y:%m:%d %H:%M:%S') + timezone_str
+        return str(self.value)
 
 
 class DateTimeArgument(ExportArgument):
