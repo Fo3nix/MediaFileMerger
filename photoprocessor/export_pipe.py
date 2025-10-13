@@ -24,7 +24,7 @@ from photoprocessor.merger import MergeStep, GPSMergeStep, MergeContext, BasicFi
 # --- Configuration ---
 CONFIG = {
     "EXIFTOOL_PATH": "exiftool",
-    "BATCH_SIZE": 50,
+    "BATCH_SIZE": 100,
     "MAX_COPY_WORKERS": 8,
 }
 
@@ -98,7 +98,7 @@ def write_metadata_batch(files_to_process: List[Tuple[str, str, List[ExportArgum
     processed_in_batch = 0
 
     # --- Stage 1: Try the fast batch method first ---
-    base_args = [CONFIG["EXIFTOOL_PATH"], "-common_args"]
+    base_args = ["-common_args"]
     command_args = []
     for source_path, output_path, export_args in files_to_process:
         if not export_args:
@@ -116,7 +116,21 @@ def write_metadata_batch(files_to_process: List[Tuple[str, str, List[ExportArgum
     # Remove the trailing '-execute' for the final command
     final_batch_args = base_args + command_args[:-1]
     try:
-        subprocess.run(final_batch_args, check=True, capture_output=True, text=True, encoding='utf-8')
+        with tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8', suffix=".txt") as argfile:
+            # Write common_args first, as required by exiftool
+            argfile.write("-common_args\n")
+            # Write each argument on a new line
+            for arg in final_batch_args:
+                argfile.write(f"{arg}\n")
+
+            argfile_path = argfile.name
+
+        final_command = [CONFIG["EXIFTOOL_PATH"], "-@", argfile_path]
+
+        subprocess.run(final_command, check=True, capture_output=True, text=True, encoding='utf-8')
+
+        os.remove(argfile_path)  # Clean up the temporary file
+
         return processed_in_batch
     except subprocess.CalledProcessError as e:
         print(f"\n--- ExifTool Batch Failed. Falling back to individual processing. ---")
@@ -128,6 +142,11 @@ def write_metadata_batch(files_to_process: List[Tuple[str, str, List[ExportArgum
     base_individual_args = [CONFIG["EXIFTOOL_PATH"]]
     for source_path, output_path, export_args in files_to_process:
         if not export_args:
+            continue
+
+        # check if output_path already exists, skip if so
+        if os.path.exists(output_path):
+            successful_count += 1
             continue
 
         file_specific_args = _generate_exiftool_args_for_file(export_args)
@@ -417,7 +436,7 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
     fh.setFormatter(formatter)
     conflict_logger.addHandler(fh)
 
-    total_stats = {"exported": 0, "skipped": 0, "conflicts": 0}
+    total_stats = {"exported": 0, "skipped": 0, "conflicts": 0, "failed": 0}
     processed_media_ids = set()
 
 
@@ -458,15 +477,19 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
                         total_stats[key] += stats[key]
                     pbar.update(batch_size_bytes)
                     pbar.set_postfix(exported=total_stats['exported'], skipped=total_stats['skipped'],
-                                     conflicts=total_stats['conflicts'], failed=stats['failed'])
+                                     conflicts=total_stats['conflicts'], failed=total_stats['failed'])
     finally:
         print("\n--- Export Complete ---")
         print(f"✅ Successfully exported {total_stats['exported']} new files.")
-        print(f"⏩ Skipped {total_stats['skipped']} files that already existed in the destination.")
+        print(f"⏩ Skipped {total_stats['skipped']}.")
         if total_stats['conflicts'] > 0:
             print(f"⚠️ Encountered {total_stats['conflicts']} merge conflicts. These files were copied WITHOUT metadata to the '{os.path.basename(conflict_dir)}' subfolder for manual review.")
             print(f"   See the full list of conflicts in the log file: {conflict_log_path}")
             print(f"   A list of conflicted file paths has been saved to: {conflict_paths_file}")
+
+        if total_stats['failed'] > 0:
+            print(f"❌ Failed to export {total_stats['failed']} corrupted or unreadable files.")
+
         print("-----------------------")
 
 
