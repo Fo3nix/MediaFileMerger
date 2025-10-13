@@ -371,6 +371,7 @@ def process_export_batch(
 
             os.makedirs(os.path.dirname(unique_conflict_path), exist_ok=True)
             files_to_copy_conflict.append((source_loc_to_copy.path, unique_conflict_path))
+            processed_media_ids.add(loc.media_file.id)
             continue
 
         # Pass the raw merged_data dict for path generation, as it contains simple values.
