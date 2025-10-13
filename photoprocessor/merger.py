@@ -841,6 +841,7 @@ class FallbackDateToGpsDateTimeStep(MergeStep):
         lon = context.get_value("gps_longitude")
         if lat is None or lon is None:
             return None
+        print('Inferring timezone from GPS coordinates:', lat, lon)
         tz_name = self.tz_finder.timezone_at(lat=lat, lng=lon)
         if tz_name is None:
             return None
@@ -903,36 +904,6 @@ class FallbackDateTimeStep(MergeStep):
             target_arg = DateTimeArgument(fallback_value, self.field_name)
             # Set the final value for the target field in the context.
             context.set_value(self.field_name, target_arg)
-
-class FallbackModifiedDateStep(MergeStep):
-    """
-    Sets the modified date to the taken date if no modified date was found
-    and no conflicts occurred during the initial modified date merge.
-    This step should run AFTER the primary DateTimeAndZoneMergeStep for 'modified'.
-    """
-    def process(self, context: MergeContext):
-        # 1. Check if a 'modified' date has already been successfully merged.
-        if "modified" in context.finalized_fields:
-            return  # A value already exists, so do nothing.
-
-        # 2. Check if the original 'modified' date step recorded a conflict.
-        if "modified" in context.conflicts:
-            return  # There was a conflict, so we should not apply a fallback.
-
-        # 3. If we proceed, it means 'modified' is empty and conflict-free.
-        #    Try to get the 'taken' date value, which should have been finalized by a previous step.
-        try:
-            taken_date_arg = context.get_value("taken", required=True)
-        except RuntimeError:
-            # This should not happen if the pipeline is ordered correctly, but it's a safe check.
-            return
-
-        if taken_date_arg:
-            fallback_value = taken_date_arg.value if isinstance(taken_date_arg, DateTimeArgument) else taken_date_arg
-
-            modified_arg = DateTimeArgument(fallback_value, "modified")
-            # Set the final value for 'modified' in the context.
-            context.set_value("modified", modified_arg)
 
 # --- The Pipeline Orchestrator ---
 
