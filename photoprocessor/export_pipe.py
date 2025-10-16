@@ -7,13 +7,14 @@ import time
 from datetime import datetime, timezone
 from fileinput import filename
 from typing import List, Dict, Tuple, Any
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
 import re
 import tempfile
 import contextlib
 import dataclasses
 from enum import Enum, auto
+import threading
 
 from tqdm import tqdm
 from sqlalchemy.orm import Session, selectinload
@@ -27,7 +28,7 @@ from photoprocessor.merger import MergeStep, GPSMergeStep, MergeContext, BasicFi
 CONFIG = {
     "EXIFTOOL_PATH": "exiftool",
     "BATCH_SIZE": 100,
-    "MAX_COPY_WORKERS": 8,
+    "MAX_WORKERS": 4,
 }
 
 
@@ -335,7 +336,8 @@ def _prepare_export_jobs(
         pipeline: MergePipeline,
         owner: models.Owner,
         export_dir: str,
-        processed_media_ids: set
+        processed_media_ids: set,
+        processed_ids_lock: threading.Lock
 ) -> List[FileExportJob]:
     """
     Runs the merge pipeline for each location and creates a FileExportJob object.
@@ -343,14 +345,13 @@ def _prepare_export_jobs(
     """
     jobs = []
     for loc in locations:
-        if loc.media_file.id in processed_media_ids:
-            # We create a job object even for skipped files to include them in stats.
-            # No other data is needed.
-            job = FileExportJob(loc.media_file, loc, [], "", status=ExportStatus.SKIPPED)
-            jobs.append(job)
-            continue
+        with processed_ids_lock:
+            if loc.media_file.id in processed_media_ids:
+                job = FileExportJob(loc.media_file, loc, [], "", status=ExportStatus.SKIPPED)
+                jobs.append(job)
+                continue # Continue inside the lock to ensure it's released
 
-        processed_media_ids.add(loc.media_file.id)
+            processed_media_ids.add(loc.media_file.id)
 
         # The best location to copy is the largest one
         source_loc_to_copy = sorted(
@@ -412,21 +413,24 @@ def process_export_batch(
         conflict_fp,
         pipeline: MergePipeline,
         processed_media_ids: set,
-        owner: models.Owner
-) -> Dict[str, int]:
+        owner: models.Owner,
+        processed_ids_lock: threading.Lock,
+        conflict_fp_lock: threading.Lock
+) -> Tuple[Dict[str, int], int]:
     """
     Processes a batch of files using the new Job-based workflow.
     Returns a dictionary of stats.
     """
     # 1. Prepare job objects for all files in the batch
-    jobs = _prepare_export_jobs(batch_locations, pipeline, owner, export_dir, processed_media_ids)
+    jobs = _prepare_export_jobs(batch_locations, pipeline, owner, export_dir, processed_media_ids, processed_ids_lock)
 
     # 2. Handle conflicts: log them and copy to conflict_dir
     conflicted_jobs = [j for j in jobs if j.status == ExportStatus.CONFLICT]
     for job in conflicted_jobs:
         log_conflict(logger, job.source_location_to_copy.path, eval(job.error_message))
-        conflict_fp.write(f"{job.source_location_to_copy.path}\n")
-        conflict_fp.flush()
+        with conflict_fp_lock:
+            conflict_fp.write(f"{job.source_location_to_copy.path}\n")
+            conflict_fp.flush()
 
         conflict_path = os.path.join(conflict_dir, job.relative_path)
         unique_conflict_path = find_unique_filepath(conflict_path)
@@ -458,7 +462,8 @@ def process_export_batch(
         "conflicts": len([j for j in jobs if j.status == ExportStatus.CONFLICT]),
         "failed": len([j for j in jobs if j.status == ExportStatus.FAILED]),
     }
-    return stats
+    batch_size_bytes = sum(loc.file_size for loc in batch_locations)
+    return stats, batch_size_bytes
 # --- Main Execution ---
 
 def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
@@ -500,9 +505,11 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
 
     export_merge_pipeline = MergePipeline.get_default_pipeline()
 
+    processed_ids_lock = threading.Lock()
+    conflict_fp_lock = threading.Lock()
+
     try:
-        with SessionLocal() as db, ThreadPoolExecutor(max_workers=CONFIG["MAX_COPY_WORKERS"]) as executor, \
-                open(conflict_paths_file, 'w', encoding='utf-8') as conflict_fp:
+        with SessionLocal() as db, open(conflict_paths_file, 'w', encoding='utf-8') as conflict_fp:
 
             locations_to_export = []
             if filelist_path:
@@ -525,24 +532,35 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
             total_files = len(locations_to_export)
             print(f"Found {total_files} files to process for export ({total_size_bytes / (1024 ** 3):.2f} GB).")
 
-            with tqdm(total=total_size_bytes, desc="Exporting Media", unit="B", unit_scale=True,
-                      unit_divisor=1024) as pbar:
+            with ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as executor, \
+                 tqdm(total=total_size_bytes, desc="Exporting Media", unit="B", unit_scale=True, unit_divisor=1024) as pbar:
+
+                futures = []
+                # Submit all batches to the thread pool
                 for i in range(0, total_files, CONFIG["BATCH_SIZE"]):
                     batch = locations_to_export[i:i + CONFIG["BATCH_SIZE"]]
-                    batch_size_bytes = sum(loc.file_size for loc in batch)
-
-                    # UPDATE THIS FUNCTION CALL to include failed_dir
-                    stats = process_export_batch(
+                    # Submit the job and pass the required locks
+                    future = executor.submit(
+                        process_export_batch,
                         batch, export_dir, conflict_dir, failed_dir,
                         conflict_logger, conflict_fp, export_merge_pipeline,
-                        processed_media_ids, owner
+                        processed_media_ids, owner,
+                        processed_ids_lock, conflict_fp_lock
                     )
+                    futures.append(future)
 
-                    for key in total_stats:
-                        total_stats[key] += stats[key]
-                    pbar.update(batch_size_bytes)
-                    pbar.set_postfix(exported=total_stats['exported'], skipped=total_stats['skipped'],
-                                     conflicts=total_stats['conflicts'], failed=total_stats['failed'])
+                # Process results as they are completed
+                for future in as_completed(futures):
+                    try:
+                        stats, processed_bytes = future.result()
+                        # Update totals and progress bar
+                        for key in total_stats:
+                            total_stats[key] += stats[key]
+                        pbar.update(processed_bytes)
+                        pbar.set_postfix(exported=total_stats['exported'], skipped=total_stats['skipped'],
+                                         conflicts=total_stats['conflicts'], failed=total_stats['failed'])
+                    except Exception as e:
+                        print(f"\nCRITICAL ERROR in worker thread: {e}")
     finally:
         print("\n--- Export Complete ---")
         print(f"✅ Successfully exported {total_stats['exported']} new files.")
