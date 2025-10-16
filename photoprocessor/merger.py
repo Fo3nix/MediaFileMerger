@@ -869,7 +869,7 @@ class FallbackDateToGpsDateTimeStep(MergeStep):
 
                 # Set the final value for 'taken' in the context.
                 context.set_value("taken", taken_arg)
-                print(f"Fallback: Set 'taken' to GPSDateTime {gps_datetime_arg.isoformat()} with timezone {inferred_tz.key if inferred_tz else 'None'}")
+                # print(f"Fallback: Set 'taken' to GPSDateTime {gps_datetime_arg.isoformat()} with timezone {inferred_tz.key if inferred_tz else 'None'}")
 
 
 class FallbackDateTimeStep(MergeStep):
