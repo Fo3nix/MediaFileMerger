@@ -12,6 +12,8 @@ import sys
 import re
 import tempfile
 import contextlib
+import dataclasses
+from enum import Enum, auto
 
 from tqdm import tqdm
 from sqlalchemy.orm import Session, selectinload
@@ -31,10 +33,35 @@ CONFIG = {
 
 # --- End Configuration ---
 
-class MergeConflictException(Exception):
-    def __init__(self, message, conflicts):
-        super().__init__(message)
-        self.conflicts = conflicts
+# Add this new Enum and Dataclass
+class ExportStatus(Enum):
+    """Represents the state of a file export job."""
+    PENDING_EXPORT = auto()
+    SUCCESS = auto()
+    CONFLICT = auto()
+    FAILED = auto()
+    SKIPPED = auto()
+
+
+@dataclasses.dataclass
+class FileExportJob:
+    """A dataclass to hold all information for exporting a single media file."""
+    media_file: models.MediaFile
+    source_location_to_copy: models.Location
+    export_arguments: List[ExportArgument]
+    relative_path: str
+
+    # These fields will be populated as the job is processed
+    final_output_path: str = ""
+    status: ExportStatus = ExportStatus.PENDING_EXPORT
+    error_message: str = ""
+
+    def get_exiftool_args_as_list(self) -> List[str]:
+        """Helper to get the string args for logging or debugging."""
+        args = []
+        for arg_object in self.export_arguments:
+            args.extend(arg_object.build())
+        return args
 
 
 # --- Core Functions ---
@@ -67,105 +94,94 @@ def get_locations_by_paths(db: Session, paths: List[str]) -> List[models.Locatio
             # This is the full chain to load everything needed
             selectinload(models.MediaFile.locations).options(
                 selectinload(models.Location.owners),  # <-- ADD THIS LINE
-                selectinload(models.Location.metadata_entries).selectinload(
+                selectinload(models.Location.metadata_sources).selectinload(
                     models.MetadataSource.entries)
             )
         )
     ).all()
 
-
-def _generate_exiftool_args_for_file(export_arguments: List[ExportArgument]) -> List[str]:
+def write_metadata_batch(jobs_to_process: List[FileExportJob]):
     """
-    Generates the list of ExifTool command-line args for a single file's metadata
-    by calling the build() method on each ExportArgument object.
+    Writes metadata by creating a new file using ExifTool's -o option.
+    Handles partially successful batch runs before falling back to individual processing.
     """
-    args = []
-    for arg_object in export_arguments:
-        args.extend(arg_object.build())
-    return args
-
-
-def write_metadata_batch(files_to_process: List[Tuple[str, str, List[ExportArgument]]]) -> int:
-    """
-    Writes metadata using a hybrid batch approach.
-    Tries to write all metadata in a single ExifTool command for performance.
-    If the batch fails, it falls back to processing files individually to
-    isolate the error and save metadata for the successful files.
-    """
-    if not files_to_process:
-        return 0
-
-    processed_in_batch = 0
+    if not jobs_to_process:
+        return
 
     # --- Stage 1: Try the fast batch method first ---
     base_args = ["-common_args"]
     command_args = []
-    for source_path, output_path, export_args in files_to_process:
-        if not export_args:
+    for job in jobs_to_process:
+        if not job.export_arguments:
+            # Handle files with no metadata as simple copies
+            try:
+                copy_file_task((job.source_location_to_copy.path, job.final_output_path))
+                job.status = ExportStatus.SUCCESS
+            except Exception as e:
+                job.status = ExportStatus.FAILED
+                job.error_message = f"File copy failed: {e}"
             continue
-        file_args = _generate_exiftool_args_for_file(export_args)
+
+        file_args = job.get_exiftool_args_as_list()
         if file_args:
             command_args.extend(file_args)
-            command_args.extend(["-o", output_path, source_path])
+            command_args.extend(["-o", job.final_output_path, job.source_location_to_copy.path])
             command_args.append("-execute")
-            processed_in_batch += 1
 
     if not command_args:
-        return 0
+        return  # All jobs were simple copies
 
-    # Remove the trailing '-execute' for the final command
     final_batch_args = base_args + command_args[:-1]
+    argfile_path = None
     try:
         with tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8', suffix=".txt") as argfile:
-            # Write common_args first, as required by exiftool
-            argfile.write("-common_args\n")
-            # Write each argument on a new line
-            for arg in final_batch_args:
-                argfile.write(f"{arg}\n")
-
+            argfile.write("\n".join(final_batch_args))
             argfile_path = argfile.name
 
         final_command = [CONFIG["EXIFTOOL_PATH"], "-@", argfile_path]
-
         subprocess.run(final_command, check=True, capture_output=True, text=True, encoding='utf-8')
 
-        os.remove(argfile_path)  # Clean up the temporary file
+        # If the batch command succeeds, all pending jobs are now successful.
+        for job in jobs_to_process:
+            if job.status == ExportStatus.PENDING_EXPORT:
+                job.status = ExportStatus.SUCCESS
+        return  # Success, exit the function.
 
-        return processed_in_batch
     except subprocess.CalledProcessError as e:
         print(f"\n--- ExifTool Batch Failed. Falling back to individual processing. ---")
         print(f"Original Batch Error: {e.stderr.strip()}")
         print("----------------------------------------------------------------------")
+        # Proceed to fallback...
+
+    finally:
+        # This ensures the temp file is always removed, even after an error.
+        if argfile_path and os.path.exists(argfile_path):
+            os.remove(argfile_path)
 
     # --- Stage 2: Fallback to processing files individually ---
-    successful_count = 0
-    base_individual_args = [CONFIG["EXIFTOOL_PATH"]]
-    for source_path, output_path, export_args in files_to_process:
-        if not export_args:
+    for job in jobs_to_process:
+        if job.status != ExportStatus.PENDING_EXPORT:
             continue
 
-        # check if output_path already exists, skip if so
-        if os.path.exists(output_path):
-            successful_count += 1
+        # CRITICAL FIX: Check if the file was created by the failed batch before retrying.
+        if os.path.exists(job.final_output_path):
+            job.status = ExportStatus.SUCCESS
             continue
 
-        file_specific_args = _generate_exiftool_args_for_file(export_args)
-        if not file_specific_args:
-            continue
+        file_specific_args = job.get_exiftool_args_as_list()
+        final_individual_args = [CONFIG["EXIFTOOL_PATH"]] + file_specific_args + \
+                                ["-o", job.final_output_path, job.source_location_to_copy.path]
 
-        final_individual_args = base_individual_args + file_specific_args + ["-o", output_path, source_path]
         try:
             subprocess.run(final_individual_args, check=True, capture_output=True, text=True, encoding='utf-8')
-            successful_count += 1
+            job.status = ExportStatus.SUCCESS
         except subprocess.CalledProcessError as individual_e:
-            # A single file failed. Log it and continue with the rest of the batch.
+            job.status = ExportStatus.FAILED
+            job.error_message = individual_e.stderr.strip()
             print(f"\n--- Individual ExifTool Error ---")
-            print(f"Failed to apply metadata to: {os.path.basename(output_path)}")
-            print(f"Error: {individual_e.stderr.strip()}")
+            print(f"Failed to process: {os.path.basename(job.final_output_path)}")
+            print(f"Error: {job.error_message}")
             print("---------------------------------")
-
-    return successful_count
-
 
 def copy_file_task(src_dst_tuple: Tuple[str, str]):
     """
@@ -192,7 +208,6 @@ def copy_file_task(src_dst_tuple: Tuple[str, str]):
             # Catch any other unexpected copy errors
             return src, e
 
-
 def log_conflict(logger: logging.Logger, file_path: str, conflicts: Dict[str, List[str]]):
     """Formats and logs a merge conflict message with messages grouped by field."""
 
@@ -209,14 +224,14 @@ def log_conflict(logger: logging.Logger, file_path: str, conflicts: Dict[str, Li
     details_str = "\n    ".join(conflict_lines)
     logger.warning(f"{file_path}\n    {details_str}")
 
-
 def generate_relative_export_path(media_file: models.MediaFile, export_arguments: List[ExportArgument], owner: models.Owner) -> str:
     """
     Generates the full relative export path for a media file based on a prioritized
     set of rules, falling back to a year-based structure using the merged metadata.
     """
 
-    filename = media_file.locations[0].filename
+    best_location = sorted(media_file.locations, key=lambda l: (-l.file_size, l.id))[0]
+    filename = best_location.filename
 
     ### --- First Priority: Check for User-Suggested Export Path --- ###
     ownerships = [
@@ -289,7 +304,6 @@ def generate_relative_export_path(media_file: models.MediaFile, export_arguments
     # 4. Final fallback for files with no usable date information
     return os.path.join("Unknown_Date", filename)
 
-
 def find_unique_filepath(destination_path: str) -> str:
     """
     Checks if a file exists at the destination. If so, it appends a number
@@ -313,98 +327,138 @@ def find_unique_filepath(destination_path: str) -> str:
 
         counter += 1
 
+
+# In export_pipe.py
+
+def _prepare_export_jobs(
+        locations: List[models.Location],
+        pipeline: MergePipeline,
+        owner: models.Owner,
+        export_dir: str,
+        processed_media_ids: set
+) -> List[FileExportJob]:
+    """
+    Runs the merge pipeline for each location and creates a FileExportJob object.
+    This step identifies conflicts and files to be skipped.
+    """
+    jobs = []
+    for loc in locations:
+        if loc.media_file.id in processed_media_ids:
+            # We create a job object even for skipped files to include them in stats.
+            # No other data is needed.
+            job = FileExportJob(loc.media_file, loc, [], "", status=ExportStatus.SKIPPED)
+            jobs.append(job)
+            continue
+
+        processed_media_ids.add(loc.media_file.id)
+
+        # The best location to copy is the largest one
+        source_loc_to_copy = sorted(
+            loc.media_file.locations,
+            key=lambda l: (-l.file_size, l.id)
+        )[0]
+
+        all_sources_for_file = [s for l in loc.media_file.locations for s in l.metadata_sources]
+
+        final_arguments = []
+        result_context = None
+
+        if all_sources_for_file:
+            # Run the merge pipeline only if metadata sources exist
+            result_context = pipeline.run(all_sources_for_file)
+            final_arguments = result_context.get_all_arguments()
+
+        relative_path = generate_relative_export_path(loc.media_file, final_arguments, owner)
+
+        job = FileExportJob(loc.media_file, source_loc_to_copy, final_arguments, relative_path)
+
+        # Check for merge conflicts
+        if result_context.conflicts:
+            job.status = ExportStatus.CONFLICT
+            job.error_message = str(result_context.conflicts)  # Store conflicts as the error
+
+        jobs.append(job)
+    return jobs
+
+
+def _handle_failed_job(job: FileExportJob, failed_dir: str):
+    """Copies the source file that failed to the failed_dir and logs its arguments."""
+    try:
+        # The file was never copied to the export dir, so we copy the original source
+        failure_path = os.path.join(failed_dir, job.relative_path)
+        unique_failure_path = find_unique_filepath(failure_path)
+        os.makedirs(os.path.dirname(unique_failure_path), exist_ok=True)
+        shutil.copyfile(job.source_location_to_copy.path, unique_failure_path)
+
+        # Create the arguments log file
+        args_log_path = os.path.splitext(unique_failure_path)[0] + ".txt"
+        with open(args_log_path, 'w', encoding='utf-8') as f:
+            f.write(f"Source file: {job.source_location_to_copy.path}\n")
+            f.write(f"Intended destination: {job.final_output_path}\n\n")
+            f.write(f"--- ExifTool Error ---\n{job.error_message}\n\n")
+            f.write("--- Generated Arguments ---\n")
+            args_list = job.get_exiftool_args_as_list()
+            f.write("\n".join(args_list))
+    except Exception as e:
+        print(f"\nCRITICAL: Could not process failed job for {job.source_location_to_copy.path}: {e}")
+
+
 def process_export_batch(
         batch_locations: List[models.Location],
         export_dir: str,
         conflict_dir: str,
-        executor: ThreadPoolExecutor,
+        failed_dir: str,
         logger: logging.Logger,
         conflict_fp,
         pipeline: MergePipeline,
         processed_media_ids: set,
         owner: models.Owner
-) -> Dict[str, Any]:
-    """Processes a single batch of files: merge, parallel copy, and batch metadata write."""
-    stats = {"exported": 0, "skipped": 0, "conflicts": 0, "failed": 0}
-    files_to_copy_conflict = []
-    files_for_metadata: List[Tuple[str, str, List[ExportArgument]]] = []
+) -> Dict[str, int]:
+    """
+    Processes a batch of files using the new Job-based workflow.
+    Returns a dictionary of stats.
+    """
+    # 1. Prepare job objects for all files in the batch
+    jobs = _prepare_export_jobs(batch_locations, pipeline, owner, export_dir, processed_media_ids)
 
-    for loc in batch_locations:
-        if loc.media_file.id in processed_media_ids:
-            stats["skipped"] += 1
-            continue
+    # 2. Handle conflicts: log them and copy to conflict_dir
+    conflicted_jobs = [j for j in jobs if j.status == ExportStatus.CONFLICT]
+    for job in conflicted_jobs:
+        log_conflict(logger, job.source_location_to_copy.path, eval(job.error_message))
+        conflict_fp.write(f"{job.source_location_to_copy.path}\n")
+        conflict_fp.flush()
 
-        # Get all locations for this media file
-        all_locations_for_file = loc.media_file.locations
+        conflict_path = os.path.join(conflict_dir, job.relative_path)
+        unique_conflict_path = find_unique_filepath(conflict_path)
+        os.makedirs(os.path.dirname(unique_conflict_path), exist_ok=True)
+        copy_file_task((job.source_location_to_copy.path, unique_conflict_path))
 
-        # Sort them by file size (desc) and then by location ID (asc)
-        # We use os.path.getsize() for the most accurate current size.
-        sorted_locations = sorted(
-            all_locations_for_file,
-            key=lambda l: (-l.file_size, l.id)
-        )
+    # 3. Handle pending exports: Calculate final paths and run batch exiftool command
+    jobs_to_export = [j for j in jobs if j.status == ExportStatus.PENDING_EXPORT]
 
-        # The best location to copy from is the first one in the sorted list
-        source_loc_to_copy = sorted_locations[0]
+    # Set final paths and create directories
+    for job in jobs_to_export:
+        initial_path = os.path.join(export_dir, job.relative_path)
+        job.final_output_path = find_unique_filepath(initial_path)
+        os.makedirs(os.path.dirname(job.final_output_path), exist_ok=True)
 
-        # IMPORTANT: A file's canonical metadata is derived from ALL its locations.
-        all_sources_for_file = [source for location in loc.media_file.locations for source in location.metadata_sources]
-        if not all_sources_for_file:
-            stats["skipped"] += 1
-            print(f"\n⚠️  Skipping file with no metadata sources: {loc.path}")
-            continue
+    # Batch write metadata. This function now handles the copy as well.
+    if jobs_to_export:
+        write_metadata_batch(jobs_to_export)
 
-        result_context = pipeline.run(all_sources_for_file)
+    # 4. Handle jobs that failed the exiftool step
+    failed_jobs = [j for j in jobs_to_export if j.status == ExportStatus.FAILED]
+    for job in failed_jobs:
+        _handle_failed_job(job, failed_dir)
 
-        # Get the final arguments. This also runs the conflict check internally.
-        final_arguments = result_context.get_all_arguments()
-        relative_path = generate_relative_export_path(loc.media_file, final_arguments, owner)
-
-        # Check for any conflicts recorded during the merge process OR by the argument validation.
-        if result_context.conflicts:
-            stats["conflicts"] += 1
-            log_conflict(logger, loc.path, result_context.conflicts)
-            conflict_fp.write(f"{loc.path}\n")
-            conflict_fp.flush()
-            initial_conflict_path = os.path.join(conflict_dir, relative_path)
-            unique_conflict_path = find_unique_filepath(initial_conflict_path)
-
-            os.makedirs(os.path.dirname(unique_conflict_path), exist_ok=True)
-            files_to_copy_conflict.append((source_loc_to_copy.path, unique_conflict_path))
-            processed_media_ids.add(loc.media_file.id)
-            continue
-
-        # Pass the raw merged_data dict for path generation, as it contains simple values.
-        initial_output_path = os.path.join(export_dir, relative_path)
-        unique_output_path = find_unique_filepath(initial_output_path)
-        output_dir_for_file = os.path.dirname(unique_output_path)
-        os.makedirs(output_dir_for_file, exist_ok=True)
-
-        # Prepare the tuple for the single exiftool command
-        files_for_metadata.append((source_loc_to_copy.path, unique_output_path, final_arguments))
-        processed_media_ids.add(loc.media_file.id)
-
-    if files_to_copy_conflict:
-        # We just need to execute the copy, we already counted the conflicts
-        # for src, error in executor.map(copy_file_task, files_to_copy_conflict):
-        #     if error:
-        #         print(f"\nError copying conflicted file {src}: {error}")
-        for src, dst in files_to_copy_conflict:
-            try:
-                copy_file_task((src,dst))
-            except Exception as e:
-                stats["failed"] += 1
-                print(f"\nError copying conflicted file {src} to {dst}: {e}")
-    if files_for_metadata:
-        try:
-            exported_count = write_metadata_batch(files_for_metadata)
-            stats["exported"] += exported_count
-            stats["failed"] += len(files_for_metadata) - exported_count
-        except Exception as e:
-            print(f"\nMetadata batch write failed: {e}")
+    # 5. Tally final stats from all job objects
+    stats = {
+        "exported": len([j for j in jobs if j.status == ExportStatus.SUCCESS]),
+        "skipped": len([j for j in jobs if j.status == ExportStatus.SKIPPED]),
+        "conflicts": len([j for j in jobs if j.status == ExportStatus.CONFLICT]),
+        "failed": len([j for j in jobs if j.status == ExportStatus.FAILED]),
+    }
     return stats
-
-
 # --- Main Execution ---
 
 def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
@@ -418,6 +472,9 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
 
     conflict_dir = os.path.join(export_dir, "conflicted_files_for_review")
     os.makedirs(conflict_dir, exist_ok=True)
+
+    failed_dir = os.path.join(export_dir, "failed_exports")
+    os.makedirs(failed_dir, exist_ok=True)
 
     conflict_log_path = os.path.join(export_dir, 'export_conflicts.log')
     conflict_paths_file = os.path.join(export_dir, 'export_conflicts_paths.txt')
@@ -473,7 +530,14 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
                 for i in range(0, total_files, CONFIG["BATCH_SIZE"]):
                     batch = locations_to_export[i:i + CONFIG["BATCH_SIZE"]]
                     batch_size_bytes = sum(loc.file_size for loc in batch)
-                    stats = process_export_batch(batch, export_dir, conflict_dir, executor, conflict_logger, conflict_fp, export_merge_pipeline, processed_media_ids, owner)
+
+                    # UPDATE THIS FUNCTION CALL to include failed_dir
+                    stats = process_export_batch(
+                        batch, export_dir, conflict_dir, failed_dir,
+                        conflict_logger, conflict_fp, export_merge_pipeline,
+                        processed_media_ids, owner
+                    )
+
                     for key in total_stats:
                         total_stats[key] += stats[key]
                     pbar.update(batch_size_bytes)
@@ -484,12 +548,16 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
         print(f"✅ Successfully exported {total_stats['exported']} new files.")
         print(f"⏩ Skipped {total_stats['skipped']}.")
         if total_stats['conflicts'] > 0:
-            print(f"⚠️ Encountered {total_stats['conflicts']} merge conflicts. These files were copied WITHOUT metadata to the '{os.path.basename(conflict_dir)}' subfolder for manual review.")
+            print(
+                f"⚠️ Encountered {total_stats['conflicts']} merge conflicts. These files were copied WITHOUT metadata to the '{os.path.basename(conflict_dir)}' subfolder for manual review.")
             print(f"   See the full list of conflicts in the log file: {conflict_log_path}")
             print(f"   A list of conflicted file paths has been saved to: {conflict_paths_file}")
 
         if total_stats['failed'] > 0:
-            print(f"❌ Failed to export {total_stats['failed']} corrupted or unreadable files.")
+            # UPDATE THIS MESSAGE for more clarity
+            print(f"❌ Failed to export {total_stats['failed']} files due to copy or metadata errors.")
+            print(
+                f"   These files, along with their intended ExifTool arguments, have been saved to the '{os.path.basename(failed_dir)}' folder for inspection.")
 
         print("-----------------------")
 
