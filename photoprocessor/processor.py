@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from queue import Queue, Empty
 from functools import lru_cache
+import tempfile
 
 from photoprocessor.google_json_finder import GoogleJsonFinder
 
@@ -205,39 +206,72 @@ class PhotoProcessor:
         self.tf = TimezoneFinder()
         self.json_finder = GoogleJsonFinder()
 
-    def _get_exiftool_batch_dict(self, filepaths: list[str]) -> list[dict]:
+    def _get_exiftool_batch_dict(self, filepaths: list[str]) -> tuple[list[dict], list[dict]]:
         """
         Extracts metadata from a BATCH of files using a single exiftool call.
         """
+        required_tags = [
+            "-MIMEType",
+            "-FileSize",
+            "-GPSLatitude",
+            "-GPSLongitude",
+            "-time:all"
+        ]
+
+        args = [
+            # "-charset", "FileName=UTF8",
+            # "-api", "QuickTimeUTC",  # Turns QuickTime dates into my local timezone !!NOT WANTED!!
+            "-d", "%Y-%m-%dT%H:%M:%S%:z",  # This format is correct
+            "-G", "-n", "-json", "-a",
+            *required_tags,
+        ]
+
+        final_args = [*args, *filepaths]
+
+        argfile_path = None
         try:
-            # Pass all filepaths to a single exiftool command.
-            # It will return a list of JSON objects, one for each file.
+            with tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8', suffix=".txt") as argfile:
+                argfile.write("\n".join(final_args))
+                argfile_path = argfile.name
 
-            required_tags = [
-                "-MIMEType",
-                "-FileSize",
-                "-GPSLatitude",
-                "-GPSLongitude",
-                "-time:all"
-            ]
+            final_command = ["exiftool", "-@", argfile_path]
+            result = subprocess.run(final_command, check=True, capture_output=True, text=True)
+            return json.loads(result.stdout), []  # Success, no failures
 
-            args = [
-                "exiftool",
-                # "-api", "QuickTimeUTC",  # Turns QuickTime dates into my local timezone !!NOT WANTED!!
-                "-d", "%Y-%m-%dT%H:%M:%S%:z",  # This format is correct
-                "-G", "-n", "-json", "-a",
-                *required_tags,
-                *filepaths
-            ]
-            result = subprocess.run(args, check=True, capture_output=True, text=True)
-            return json.loads(result.stdout)
-        except (FileNotFoundError):
+        except FileNotFoundError:
             print("ERROR: exiftool command not found. Please install it and ensure it's in your PATH.")
             raise
+
         except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-            print(f"Warning: Could not get exiftool data for a batch: {e}")
-            # Return an empty list of the same size so the caller can map results.
-            return [{} for _ in filepaths]
+            # --- Stage 2: Fallback to individual processing ---
+            print(f"Warning: Exiftool batch failed. Falling back to individual processing. Error: {e}")
+
+            results = []
+            failures = []
+            individual_args_base = [
+                "exiftool",
+                *args
+            ]
+
+            for path in filepaths:
+                try:
+                    final_individual_args = individual_args_base + [path]
+                    result = subprocess.run(final_individual_args, check=True, capture_output=True, text=True)
+                    data = json.loads(result.stdout)
+                    results.append(data[0] if data else {})
+                except (subprocess.CalledProcessError, json.JSONDecodeError) as individual_e:
+                    stderr = getattr(individual_e, 'stderr', '').strip() or str(individual_e)
+                    error_msg = f"Exiftool individual processing failed. Error: {stderr}"
+                    print(f"  - Failed to process: {os.path.basename(path)}. {error_msg}")
+                    # Add a placeholder to results so indices match, and log the failure.
+                    results.append({"SourceFile": os.path.abspath(path)})
+                    failures.append({"path": path, "error": error_msg})
+
+            return results, failures
+
+        finally:
+            if argfile_path and os.path.exists(argfile_path):
+                os.remove(argfile_path)
 
     def _to_datetime(self, date_str: str, default_timezone: timezone|None) -> datetime | None:
         """
@@ -399,11 +433,13 @@ class PhotoProcessor:
             return {}, []
 
         # --- Step 1: Batched I/O for metadata (still the most efficient way) ---
-        all_raw_exif = self._get_exiftool_batch_dict(filepaths)
+        all_raw_exif, exif_failures = self._get_exiftool_batch_dict(filepaths)
         exif_map = {os.path.abspath(d.get('SourceFile')): d for d in all_raw_exif}
 
         successes = {}
         failures = []
+        failures.extend(exif_failures)
+        failed_paths = {os.path.abspath(f['path']) for f in failures}
 
         # --- Step 2: Set up the producer-consumer pipeline ---
         # A small queue to buffer images read from disk, preventing high memory usage.
@@ -442,10 +478,13 @@ class PhotoProcessor:
 
             # Submit all I/O-bound producer jobs to the thread pool
             for path in filepaths:
+                if os.path.abspath(path) in failed_paths:
+                    continue
                 io_executor.submit(producer, path)
 
             # --- The Consumer's job: Hash the pre-loaded data (CPU-bound) ---
-            for _ in range(len(filepaths)):
+            num_to_consume = len(filepaths) - len(failed_paths)
+            for _ in range(num_to_consume):
                 data = image_queue.get()
                 path = data["path"]
 

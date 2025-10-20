@@ -96,7 +96,7 @@ class Location(Base):
     media_file = relationship("MediaFile", back_populates="locations")
 
     # A location can be owned by many people (though typically one)
-    owners = relationship("MediaOwnership", back_populates="location")
+    owners = relationship("MediaOwnership", back_populates="location", cascade="all, delete-orphan")
 
     # A location can have multiple metadata entries from different sources
     metadata_sources = relationship("MetadataSource", back_populates="location", cascade="all, delete-orphan")
