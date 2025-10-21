@@ -495,22 +495,28 @@ class DateTimeAndZoneMergeStep(MergeStep):
     def _get_filename_date_candidates(self, context: MergeContext) -> List[DateTimeCandidate] | None:
         # Attempt to extract dates from filenames as a last resort
         file_name_entries = context.get_entries_by_keys(["google:title", "exiftool:SourceFile"])
+
+        container = DateTimeCandidateContainer(tolerance=timedelta(seconds=60))
+
         for entry in file_name_entries:
             if entry.value_str:
                 detected_date = self._detect_date_from_file_name(entry.value_str)
                 if detected_date:
-                    entry.value_dt = detected_date
+                    # Create a candidate from the detected naive date.
+                    candidate = DateTimeCandidate(
+                        representative_value=detected_date,
+                        source_keys={entry.key},
+                        source_ids={entry.id}
+                    )
+                    # The container automatically merges candidates that are close in time.
+                    container.add_candidate(candidate)
 
-        date_set = {entry.value_dt for entry in file_name_entries if entry.value_dt is not None}
-        aware_date_set = {d for d in date_set if d.tzinfo is not None}
-        naive_date_set = {d for d in date_set if d.tzinfo is None}
-
-        if len(aware_date_set) > 1 or len(naive_date_set) > 1:
-            context.record_conflict(self.date_type, f"Multiple distinct dates inferred from filenames: {sorted(list(date_set))}")
+        if len(container.candidates) > 1:
+            context.record_conflict(self.date_type, f"Multiple distinct dates inferred from filenames: {container.candidates})")
             return None
 
         # return entries with value_dt set
-        return [DateTimeCandidate.from_entry(e) for e in file_name_entries if e.value_dt is not None]
+        return container.candidates
 
     def _get_candidate(self, key: str|tuple[str,str], entries: List[models.MetadataEntry]) -> DateTimeCandidate | None:
 
@@ -560,7 +566,7 @@ class DateTimeAndZoneMergeStep(MergeStep):
         return None
 
     def _get_candidate_container(self, keys: List[str|tuple[str,str]], entries: List[models.MetadataEntry]) -> DateTimeCandidateContainer:
-        container = DateTimeCandidateContainer()
+        container = DateTimeCandidateContainer(tolerance=timedelta(seconds=20))
 
         for key in keys:
             candidate = self._get_candidate(key, entries)
@@ -586,9 +592,37 @@ class DateTimeAndZoneMergeStep(MergeStep):
         except Exception:
             return None
 
+    def _pre_resolve_google_xmp_utc_heuristic(self, container: DateTimeCandidateContainer):
+        """
+        Heuristic: If a Google Photos time and an XMP time both claim to be UTC
+        but have different local times, demote the XMP candidate to be naive.
+        This allows the main resolver to use the Google (aware) time as the anchor
+        and the XMP (now naive) time to correctly infer the local timezone offset.
+        """
+        # Find candidates that ONLY have the specified key, to avoid merged ones.
+        google_cand = next((c for c in container.aware_candidates if c.source_keys == {"google:photoTakenTime"}), None)
+        xmp_cand = next((c for c in container.aware_candidates if c.source_keys == {"XMP:DateTimeOriginal"}), None)
+
+        # Conditions for the heuristic to apply:
+        # 1. Both specific, unmerged candidates must exist.
+        # 2. Both must have a UTC offset of zero.
+        if not (google_cand and xmp_cand):
+            return
+        if not (google_cand.representative_value.utcoffset() == timedelta(0) and
+                xmp_cand.representative_value.utcoffset() == timedelta(0)):
+            return
+
+        # If their naive times are different, it's the scenario we want to handle.
+        if google_cand.representative_value.replace(tzinfo=None) != xmp_cand.representative_value.replace(tzinfo=None):
+            # Demote the XMP candidate by making its datetime naive.
+            # The main resolver will now treat it as a local time suggestion.
+            xmp_cand.representative_value = xmp_cand.representative_value.replace(tzinfo=None)
+
     def process(self, context: MergeContext):
         # STEP 1: Gather all datetime candidates from metadata entries
         candidate_container = self._get_candidate_container(self._get_metadata_keys(), context.entries)
+
+        self._pre_resolve_google_xmp_utc_heuristic(candidate_container)
 
         # Also consider dates inferred from filenames, if date_type is taken
         if self.date_type == "taken":
@@ -905,6 +939,69 @@ class FallbackDateTimeStep(MergeStep):
             # Set the final value for the target field in the context.
             context.set_value(self.field_name, target_arg)
 
+
+# Fallback to whatsapp image name date
+# Add these imports at the top of merger.py
+import os
+import re
+from datetime import datetime
+
+
+# ... other classes like GPSMergeStep, DateTimeAndZoneMergeStep ...
+
+class FallbackRoughDateFromFilename(MergeStep):
+    """
+    If no 'taken' date is found, attempts to parse one from the filename,
+    specifically targeting patterns like 'IMG-YYYYMMDD-WAxxxx'.
+    """
+
+    def process(self, context: MergeContext):
+        # 1. Check if a 'taken' date already exists or had a conflict. If so, do nothing.
+        if "taken" in context.finalized_fields or "taken" in context.conflicts:
+            return
+
+        if "modified" in context.finalized_fields or "modified" in context.conflicts:
+            return
+
+        # 2. Get all possible filename entries from the context.
+        filename_entries = context.get_entries_by_keys(["google:title", "exiftool:SourceFile"])
+
+        filenames = []
+        for entry in filename_entries:
+            if entry.value_str:
+                # For 'SourceFile', we only want the filename, not the whole path.
+                if entry.key == "exiftool:SourceFile":
+                    filenames.append(os.path.basename(entry.value_str))
+                else:
+                    filenames.append(entry.value_str)
+
+        # 3. Iterate through the filenames and apply the regex.
+        for fname in filenames:
+            # This regex looks for YYYYMMDD patterns common in camera and WhatsApp files.
+            # It captures Year (e.g., 2023), Month (01-12), and Day (01-31).
+            match = re.search(r'(20[0-2]\d|19[8-9]\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])', fname)
+
+            if match:
+                year, month, day = map(int, match.groups())
+
+                try:
+                    # 4. Create a naive datetime object for noon on the parsed date.
+                    # The datetime constructor validates the date (e.g., rejects month=13).
+                    dt_value = datetime(year, month, day, 12, 0, 0)
+
+                    # 5. Create the argument and set it as the final value for 'taken' and modified.
+                    taken_arg = DateTimeArgument(dt_value, "taken")
+                    context.set_value("taken", taken_arg)
+                    modified_arg = DateTimeArgument(dt_value, "modified")
+                    context.set_value("modified", modified_arg)
+
+                    # We found a valid date from a filename, so our work here is done.
+                    return
+                except ValueError:
+                    # This catches impossible dates that the regex might allow,
+                    # such as February 30th. Continue to the next filename.
+                    continue
+
 # --- The Pipeline Orchestrator ---
 
 class MergePipeline:
@@ -921,6 +1018,7 @@ class MergePipeline:
             FallbackDateToGpsDateTimeStep(),
             FallbackDateTimeStep("modified", "taken"),
             FallbackDateTimeStep("taken", "modified"),
+            FallbackRoughDateFromFilename(),
         ]
         return cls(steps)
 
