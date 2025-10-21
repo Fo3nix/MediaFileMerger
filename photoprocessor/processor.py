@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from queue import Queue, Empty
 from functools import lru_cache
 import tempfile
+import rawpy
 
 from photoprocessor.google_json_finder import GoogleJsonFinder
 
@@ -56,6 +57,22 @@ def _cryptographic_image_hash(img_obj: Image.Image) -> str | None:
         return hashlib.sha256(pixel_data).hexdigest()
     except Exception as e:
         print(f"Warning: Could not generate cryptographic hash. Error: {e}")
+        return None
+
+def _cryptographic_raw_hash(image_path: str) -> str | None:
+    """
+    Generates a SHA-256 hash of the pixel data from a RAW image file (.dng, etc.).
+    This function uses rawpy to decode the image first.
+    """
+    try:
+        with rawpy.imread(image_path) as raw:
+            # postprocess() creates a standard 8-bit RGB image as a NumPy array
+            rgb_pixels = raw.postprocess(half_size=True, use_camera_wb=True, no_auto_bright=True)
+
+        # Convert the resulting NumPy array to bytes and hash it
+        return hashlib.sha256(rgb_pixels.tobytes()).hexdigest()
+    except Exception as e:
+        print(f"Warning: Could not generate cryptographic hash for RAW file {image_path}. Error: {e}")
         return None
 
 def _perceptual_image_hash(image_path: str) -> str | None:
@@ -460,10 +477,11 @@ class PhotoProcessor:
 
                     # Pre-load the image data from disk (I/O-bound work)
                     image_obj = None
-                    if mime_type.startswith("image/"):
+                    # Only try to open with Pillow if it's a compatible image
+                    if mime_type.startswith("image/") and not path.lower().endswith('.dng'):
                         with Image.open(path) as img:
                             img.thumbnail((256, 256))
-                            image_obj = img.copy()  # copy() is important to release file handle
+                            image_obj = img.copy()
 
                     # Put all necessary data into the queue for the consumer
                     image_queue.put({
@@ -495,7 +513,10 @@ class PhotoProcessor:
                     mime_type = data["mime_type"]
                     file_hash = None
 
-                    if mime_type.startswith("image/"):
+                    if path.lower().endswith('.dng'):
+                        # Use our new rawpy-based hasher for DNG files
+                        file_hash = _cryptographic_raw_hash(path)
+                    elif mime_type.startswith("image/") and data["image_obj"]:
                         # Hashing is CPU-bound and works on the pre-loaded image_obj
                         file_hash = _cryptographic_image_hash(data["image_obj"])
                     elif mime_type.startswith("video/"):

@@ -14,7 +14,7 @@ from photoprocessor import models
 CONFIG = {
     "BATCH_SIZE": 100,
     "MEDIA_EXTENSIONS": (
-        '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.heic', '.webp',
+        '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.heic', '.webp', '.dng',
         '.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv'
     )
 }
@@ -39,12 +39,12 @@ def get_or_create_owner(db: Session, name: str) -> models.Owner:
     return owner
 
 
-def scan_media_files(directory: str) -> List[str]:
+def scan_media_files(directory: str, ext: str = None) -> List[str]:
     print(f"Scanning for media files in {directory}...")
     paths = []
     for root, _, files in os.walk(directory):
         for file in files:
-            if file.lower().endswith(CONFIG["MEDIA_EXTENSIONS"]):
+            if file.lower().endswith(CONFIG["MEDIA_EXTENSIONS"] if ext is None else (ext,)):
                 paths.append(os.path.join(root, file))
     return paths
 
@@ -132,7 +132,7 @@ def save_batch_to_db(db: Session, owner: models.Owner, batch_data: Dict) -> (Dic
     return stats, failures
 
 
-def main(owner_name: str, takeout_dir: str = None, filelist_path: str = None):
+def main(owner_name: str, takeout_dir: str = None, filelist_path: str = None, custom_ext: str = None):
     print("Initializing...")
     models.Base.metadata.create_all(bind=engine)
 
@@ -151,11 +151,11 @@ def main(owner_name: str, takeout_dir: str = None, filelist_path: str = None):
             print(f"❌ ERROR: Input file not found at '{filelist_path}'")
             return
     elif takeout_dir:
-        all_paths = scan_media_files(takeout_dir)
+        all_paths = scan_media_files(takeout_dir, custom_ext)
 
     total_files = len(all_paths)
     if not total_files:
-        print("No media files found.");
+        print("No media files found.")
         return
 
     print(f"Found {total_files} files to process.")
@@ -218,8 +218,17 @@ if __name__ == "__main__":
     source_group.add_argument("--directory", "-d", type=str, help="The input directory to scan for media.")
     source_group.add_argument("--filelist", "-f", type=str,
                               help="Path to a text file with one file path per line to import.")
+    parser.add_argument("--ext", type=str,
+                        help="Optional custom file extension to filter by (e.g., .tiff). If not provided, all supported media types are imported.")
 
     args = parser.parse_args()
 
+    # check custom ext is in config["MEDIA_EXTENSIONS"] if provided
+    if args.ext and args.ext.lower() not in CONFIG["MEDIA_EXTENSIONS"]:
+        print(f"❌ ERROR: Custom extension '{args.ext}' is not supported. Supported extensions are: {', '.join(CONFIG['MEDIA_EXTENSIONS'])}")
+        exit(1)
+
+    ext = args.ext.lower() if args.ext else None
+
     # Call main with the new arguments
-    main(args.owner_name, takeout_dir=args.directory, filelist_path=args.filelist)
+    main(args.owner_name, takeout_dir=args.directory, filelist_path=args.filelist, custom_ext=ext)
