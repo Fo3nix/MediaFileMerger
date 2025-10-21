@@ -136,6 +136,10 @@ def write_metadata_batch(jobs_to_process: List[FileExportJob]):
         os.makedirs(os.path.dirname(job.final_output_path), exist_ok=True)
 
         final_individual_args = [CONFIG["EXIFTOOL_PATH"]] + job.get_exiftool_args_as_list() + \
+                                [
+                                    '-m', # ignore minor errors
+                                    '-P', # preserve file modification date
+                                ] + \
                                 ["-o", job.final_output_path, job.source_location_to_copy.path]
         try:
             subprocess.run(final_individual_args, check=True, capture_output=True, text=True, encoding='utf-8')
@@ -146,7 +150,11 @@ def write_metadata_batch(jobs_to_process: List[FileExportJob]):
         return
 
     # --- Recursive Step: Attempt Batch Processing ---
-    base_args = ["-common_args"]
+    base_args = [
+        "-common_args",
+        "-m",  # ignore minor errors
+        "-P",  # preserve file modification date
+    ]
     command_args = []
     for job in metadata_jobs:
         command_args.extend(job.get_exiftool_args_as_list())
