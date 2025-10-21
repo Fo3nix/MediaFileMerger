@@ -70,19 +70,18 @@ class FileExportJob:
 def get_locations_for_owner(db: Session, owner: models.Owner) -> List[models.Location]:
     """Queries all locations owned by a person with all necessary related data eagerly loaded."""
     print(f"Querying files for owner: {owner.name}...")
-    ownership_records = db.query(models.MediaOwnership).filter(
+    return db.query(models.Location).join(
+        models.MediaOwnership
+    ).filter(
         models.MediaOwnership.owner_id == owner.id
     ).options(
-        selectinload(models.MediaOwnership.location).selectinload(models.Location.media_file).options(
-            # This is the full chain to load everything needed
+        selectinload(models.Location.media_file).options(
             selectinload(models.MediaFile.locations).options(
-                selectinload(models.Location.owners),  # <-- ADD THIS LINE
-                selectinload(models.Location.metadata_sources).selectinload(
-                    models.MetadataSource.entries)
+                selectinload(models.Location.owners),
+                selectinload(models.Location.metadata_sources).selectinload(models.MetadataSource.entries)
             )
         )
     ).all()
-    return [record.location for record in ownership_records]
 
 
 def get_locations_by_paths(db: Session, paths: List[str]) -> List[models.Location]:
@@ -225,14 +224,17 @@ def log_conflict(logger: logging.Logger, file_path: str, conflicts: Dict[str, Li
     details_str = "\n    ".join(conflict_lines)
     logger.warning(f"{file_path}\n    {details_str}")
 
-def generate_relative_export_path(media_file: models.MediaFile, export_arguments: List[ExportArgument], owner: models.Owner) -> str:
+def _get_best_location(locations: List[models.Location]) -> models.Location:
+    """Selects the best location from a list based on largest file size, with ID as a tie-breaker."""
+    if not locations:
+        raise ValueError("Cannot select best location from an empty list.")
+    return sorted(locations, key=lambda l: (-l.file_size, l.id))[0]
+
+def generate_relative_export_path(media_file: models.MediaFile, export_arguments: List[ExportArgument], owner: models.Owner) -> Tuple[str, models.Location]:
     """
     Generates the full relative export path for a media file based on a prioritized
     set of rules, falling back to a year-based structure using the merged metadata.
     """
-
-    best_location = sorted(media_file.locations, key=lambda l: (-l.file_size, l.id))[0]
-    filename = best_location.filename
 
     ### --- First Priority: Check for User-Suggested Export Path --- ###
     ownerships = [
@@ -249,43 +251,61 @@ def generate_relative_export_path(media_file: models.MediaFile, export_arguments
             sanitized_paths = sorted([p.replace(os.sep, '-') for p in unique_suggestions if p])
             target_subdir = '--'.join(sanitized_paths)
 
-        return os.path.join(target_subdir, filename)
+        # For suggested paths, we still use the overall best location
+        best_overall_location = _get_best_location(media_file.locations)
+        return os.path.join(target_subdir, best_overall_location.filename), best_overall_location
 
-
-    ### --- Second Priority: Check for Known Folder Patterns in Any Location Path --- ###
-
-    # --- DEFINE YOUR FOLDER HIERARCHY HERE ---
+    # --- Define Folder Hierarchy Rules ---
     priority_rules = [
-        # (pattern_to_find_in_path, target_export_subdirectory)
         ('whatsapp images/sent', os.path.join("Whatsapp Images", "Sent")),
         ('whatsapp video/sent', os.path.join("Whatsapp Video", "Sent")),
         ('whatsapp images', "Whatsapp Images"),
         ('whatsapp video', "Whatsapp Video"),
+    ]
+    whatsapp_filename_pattern = re.compile(r'-WA\d{4}', re.IGNORECASE)
+
+    # --- Priority 2: Owner-Specific WhatsApp Logic ---
+    owner_locations = [loc for loc in media_file.locations if any(mo.owner_id == owner.id for mo in loc.owners)]
+
+    for loc in owner_locations:
+        # Check owner's locations against WhatsApp-specific rules
+        path_lower = loc.path.lower().replace('\\', '/')
+        is_whatsapp = False
+        target_subdir = ""
+
+        for pattern, subdir in priority_rules:
+            if pattern in path_lower:
+                is_whatsapp = True
+                target_subdir = subdir
+                break
+
+        if not is_whatsapp and whatsapp_filename_pattern.search(loc.filename):
+            is_whatsapp = True
+            target_subdir = "Whatsapp Video" if media_file.mime_type.startswith('video/') else "Whatsapp Images"
+
+        if is_whatsapp:
+            # If it's a WhatsApp file, the source location MUST be from the owner's pool.
+            source_location = _get_best_location(owner_locations)
+            relative_path = os.path.join(target_subdir, source_location.filename)
+            return relative_path, source_location
+
+    # --- Priority 3: General Rules (Non-WhatsApp) using ALL locations ---
+    general_rules = [
         ('dcim/camera', "Camera"),
         ('screenshots', "Screenshots"),
     ]
-
     all_paths = [loc.path.lower().replace('\\', '/') for loc in media_file.locations]
+    best_overall_location = _get_best_location(media_file.locations)
 
-    # 1. Check paths against priority rules
-    for pattern, target_subdir in priority_rules:
+    for pattern, target_subdir in general_rules:
         for path in all_paths:
             if pattern in path:
-                return os.path.join(target_subdir, filename)  # Return full relative path
+                return os.path.join(target_subdir, best_overall_location.filename), best_overall_location
 
-    # 2. Check filename pattern
-    if re.search(r'-WA\d{4}', filename, re.IGNORECASE):
-        if media_file.mime_type.startswith('video/'):
-            return os.path.join("Whatsapp Video", filename)
-        else:
-            return os.path.join("Whatsapp Images", filename)
+    if re.search(r'screenshot', best_overall_location.filename, re.IGNORECASE):
+        return os.path.join("Screenshots", best_overall_location.filename), best_overall_location
 
-    # - check screenshots in filename
-    if re.search(r'screenshot', filename, re.IGNORECASE):
-        return os.path.join("Screenshots", filename)
-
-    # --- 3. Default to Year-Based Pathing using Merged Date ---
-
+    # --- Priority 4: Default to Year-Based Pathing using Merged Date ---
     date_taken = None
     date_modified = None
     for arg in export_arguments:
@@ -295,15 +315,13 @@ def generate_relative_export_path(media_file: models.MediaFile, export_arguments
             elif arg.date_type == "modified" and isinstance(arg.value, datetime):
                 date_modified = arg.value
 
+    year_str = "Unknown_Date"
     if date_taken and isinstance(date_taken, datetime):
         year_str = str(date_taken.year)
-        return os.path.join(year_str, filename)
     elif date_modified and isinstance(date_modified, datetime):
         year_str = str(date_modified.year)
-        return os.path.join(year_str, filename)
 
-    # 4. Final fallback for files with no usable date information
-    return os.path.join("Unknown_Date", filename)
+    return os.path.join(year_str, best_overall_location.filename), best_overall_location
 
 def find_unique_filepath(destination_path: str) -> str:
     """
@@ -353,11 +371,6 @@ def _prepare_export_jobs(
 
             processed_media_ids.add(loc.media_file.id)
 
-        # The best location to copy is the largest one
-        source_loc_to_copy = sorted(
-            loc.media_file.locations,
-            key=lambda l: (-l.file_size, l.id)
-        )[0]
 
         all_sources_for_file = [s for l in loc.media_file.locations for s in l.metadata_sources]
 
@@ -369,7 +382,7 @@ def _prepare_export_jobs(
             result_context = pipeline.run(all_sources_for_file)
             final_arguments = result_context.get_all_arguments()
 
-        relative_path = generate_relative_export_path(loc.media_file, final_arguments, owner)
+        relative_path, source_loc_to_copy = generate_relative_export_path(loc.media_file, final_arguments, owner)
 
         job = FileExportJob(loc.media_file, source_loc_to_copy, final_arguments, relative_path)
 
