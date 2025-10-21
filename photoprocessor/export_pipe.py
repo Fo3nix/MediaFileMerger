@@ -102,86 +102,104 @@ def get_locations_by_paths(db: Session, paths: List[str]) -> List[models.Locatio
 
 def write_metadata_batch(jobs_to_process: List[FileExportJob]):
     """
-    Writes metadata by creating a new file using ExifTool's -o option.
-    Handles partially successful batch runs before falling back to individual processing.
+    Writes metadata by creating new files using ExifTool. It attempts a fast
+    batch operation first and recursively falls back to smaller chunks if the
+    batch fails, efficiently isolating problematic files.
     """
-    if not jobs_to_process:
-        return
-
-    # --- Stage 1: Try the fast batch method first ---
-    base_args = ["-common_args"]
-    command_args = []
+    # --- Stage 1: Separate jobs and handle simple copies ---
+    metadata_jobs = []
     for job in jobs_to_process:
+        # Only process jobs that are actually pending.
+        if job.status != ExportStatus.PENDING_EXPORT:
+            continue
+
         if not job.export_arguments:
-            # Handle files with no metadata as simple copies
             try:
+                # This is a simple file copy since there are no metadata args.
+                os.makedirs(os.path.dirname(job.final_output_path), exist_ok=True)
                 copy_file_task((job.source_location_to_copy.path, job.final_output_path))
                 job.status = ExportStatus.SUCCESS
             except Exception as e:
                 job.status = ExportStatus.FAILED
                 job.error_message = f"File copy failed: {e}"
-            continue
+        else:
+            # This job requires metadata processing.
+            metadata_jobs.append(job)
 
-        file_args = job.get_exiftool_args_as_list()
-        if file_args:
-            command_args.extend(file_args)
-            command_args.extend(["-o", job.final_output_path, job.source_location_to_copy.path])
-            command_args.append("-execute")
+    # --- Base Cases for Recursion ---
+    if not metadata_jobs:
+        return  # No metadata jobs to process.
 
-    if not command_args:
-        return  # All jobs were simple copies
+    if len(metadata_jobs) == 1:
+        job = metadata_jobs[0]
+        # Ensure destination directory exists for the single operation.
+        os.makedirs(os.path.dirname(job.final_output_path), exist_ok=True)
 
-    final_batch_args = base_args + command_args[:-1]
+        final_individual_args = [CONFIG["EXIFTOOL_PATH"]] + job.get_exiftool_args_as_list() + \
+                                ["-o", job.final_output_path, job.source_location_to_copy.path]
+        try:
+            subprocess.run(final_individual_args, check=True, capture_output=True, text=True, encoding='utf-8')
+            job.status = ExportStatus.SUCCESS
+        except subprocess.CalledProcessError as e:
+            job.status = ExportStatus.FAILED
+            job.error_message = e.stderr.strip()
+        return
+
+    # --- Recursive Step: Attempt Batch Processing ---
+    base_args = ["-common_args"]
+    command_args = []
+    for job in metadata_jobs:
+        command_args.extend(job.get_exiftool_args_as_list())
+        command_args.extend(["-o", job.final_output_path, job.source_location_to_copy.path])
+        command_args.append("-execute")
+
+    final_batch_args = base_args + command_args[:-1]  # Remove the last '-execute'
     argfile_path = None
     try:
         with tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8', suffix=".txt") as argfile:
-            argfile.write("\n".join(final_batch_args))
             argfile_path = argfile.name
+            argfile.write("\n".join(final_batch_args))
 
         final_command = [CONFIG["EXIFTOOL_PATH"], "-@", argfile_path]
         subprocess.run(final_command, check=True, capture_output=True, text=True, encoding='utf-8')
 
-        # If the batch command succeeds, all pending jobs are now successful.
-        for job in jobs_to_process:
-            if job.status == ExportStatus.PENDING_EXPORT:
+        # Post-Batch Verification: A 0 exit code doesn't guarantee all files were created.
+        remaining_jobs = []
+        for job in metadata_jobs:
+            if os.path.exists(job.final_output_path):
                 job.status = ExportStatus.SUCCESS
-        return  # Success, exit the function.
+            else:
+                job.error_message = "Exiftool batch succeeded but did not create the output file."
+                remaining_jobs.append(job)
 
-    except subprocess.CalledProcessError as e:
-        print(f"\n--- ExifTool Batch Failed. Falling back to individual processing. ---")
-        print(f"Original Batch Error: {e.stderr.strip()}")
-        print("----------------------------------------------------------------------")
-        # Proceed to fallback...
+        if remaining_jobs:
+            print(f"\nBatch finished, but {len(remaining_jobs)} files were not created. Retrying them recursively.")
+            write_metadata_batch(remaining_jobs)
+
+    except subprocess.CalledProcessError:
+        # Batch failed. Check for any partially successful files before recursing.
+        remaining_jobs = []
+        for job in metadata_jobs:
+            if os.path.exists(job.final_output_path):
+                job.status = ExportStatus.SUCCESS
+            else:
+                remaining_jobs.append(job)
+
+        if not remaining_jobs:
+            return  # All files were processed successfully before the error was thrown.
+
+        # Only print the message for larger batches to avoid clutter.
+        if len(remaining_jobs) > 1:
+            print(
+                f"\nExifTool batch of {len(metadata_jobs)} failed. {len(remaining_jobs)} file(s) did not process. Splitting and retrying.")
+
+        midpoint = len(remaining_jobs) // 2
+        write_metadata_batch(remaining_jobs[:midpoint])
+        write_metadata_batch(remaining_jobs[midpoint:])
 
     finally:
-        # This ensures the temp file is always removed, even after an error.
         if argfile_path and os.path.exists(argfile_path):
             os.remove(argfile_path)
-
-    # --- Stage 2: Fallback to processing files individually ---
-    for job in jobs_to_process:
-        if job.status != ExportStatus.PENDING_EXPORT:
-            continue
-
-        # CRITICAL FIX: Check if the file was created by the failed batch before retrying.
-        if os.path.exists(job.final_output_path):
-            job.status = ExportStatus.SUCCESS
-            continue
-
-        file_specific_args = job.get_exiftool_args_as_list()
-        final_individual_args = [CONFIG["EXIFTOOL_PATH"]] + file_specific_args + \
-                                ["-o", job.final_output_path, job.source_location_to_copy.path]
-
-        try:
-            subprocess.run(final_individual_args, check=True, capture_output=True, text=True, encoding='utf-8')
-            job.status = ExportStatus.SUCCESS
-        except subprocess.CalledProcessError as individual_e:
-            job.status = ExportStatus.FAILED
-            job.error_message = individual_e.stderr.strip()
-            print(f"\n--- Individual ExifTool Error ---")
-            print(f"Failed to process: {os.path.basename(job.final_output_path)}")
-            print(f"Error: {job.error_message}")
-            print("---------------------------------")
 
 def copy_file_task(src_dst_tuple: Tuple[str, str]):
     """
