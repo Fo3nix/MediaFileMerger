@@ -835,7 +835,20 @@ class DateTimeAndZoneMergeStep(MergeStep):
 
         # 3. Conflict
         else:
-            context.record_conflict(self.date_type, f"Multiple distinct naive datetime candidates found: {naive_candidates}. Cannot resolve without GPS-inferred timezone.")
+            # Heuristic for multiple naive dates that are close (e.g., within an hour).
+            # This can happen if a time was manually adjusted across a timezone boundary.
+            loose_container = DateTimeCandidateContainer(tolerance=timedelta(hours=1, minutes=1))
+            for cand in naive_candidates:
+                loose_container.add_candidate(cand)
+
+            if len(loose_container.candidates) == 1:
+                single_value = loose_container.candidates[0].representative_value
+                if inferred_tz:
+                    single_value = single_value.replace(tzinfo=inferred_tz)
+                return single_value
+
+            context.record_conflict(self.date_type,
+                                    f"Multiple distinct naive datetime candidates found: {naive_candidates}. Cannot resolve without GPS-inferred timezone.")
             return None
 
     def _handle_naive_pair_with_gps(
