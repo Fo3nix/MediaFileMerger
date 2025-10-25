@@ -407,11 +407,11 @@ class DateTimeAndZoneMergeStep(MergeStep):
     """
 
     UTC_KEYS = {
-        "QuickTime:CreationDate",
+        # "QuickTime:CreationDate", # Note: this seems to be already timezone aware, and otherwise local time
         "QuickTime:CreateDate",
         "QuickTime:ModifyDate",
         "Composite:GPSDateTime",
-        "Keys:CreationDate",
+        # "Keys:CreationDate", # Note: this seems to be already timezone aware, and otherwise local time
         "google:photoTakenTime",
     }
 
@@ -434,11 +434,15 @@ class DateTimeAndZoneMergeStep(MergeStep):
                 "XMP:CreateDate",
                 "EXIF:CreateDate",
                 "google:photoTakenTime",
+                "XMP-exif:DateTimeOriginal",
+                "XMP-xmp:CreateDate",
             ]
         elif self.date_type == "modified":
             return [
                 "EXIF:ModifyDate",
+                ("EXIF:ModifyDate", "EXIF:OffsetTime"),
                 "XMP:ModifyDate",
+                "XMP-xmp:ModifyDate",
                 "QuickTime:ModifyDate",
             ]
         return []

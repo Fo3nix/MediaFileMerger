@@ -82,13 +82,16 @@ class DateTimeArgument(ExportArgument):
                 tags.update({
                     "-EXIF:OffsetTimeOriginal",
                     "-XMP:DateTimeOriginal",
+                    "-XMP:CreateDate",
                     "-QuickTime:CreateDate",
                     "-Keys:CreationDate",
+                    "-QuickTime:CreationDate",
                 })
             elif self.date_type == "modified":
                 tags.update({
                     "-XMP:ModifyDate",
                     "-QuickTime:ModifyDate",
+                    "-EXIF:OffsetTime",
                 })
         return tags
 
@@ -123,13 +126,16 @@ class DateTimeArgument(ExportArgument):
                 args.extend([
                     f"-EXIF:OffsetTimeOriginal={offset_str_formatted}",
                     f"-XMP:DateTimeOriginal={self.value.isoformat()}",
+                    f"-XMP:CreateDate={self.value.isoformat()}",
                     f"-QuickTime:CreateDate={utc_time_str}",
-                    f"-Keys:CreationDate={utc_time_str}",
+                    f"-Keys:CreationDate={self.value.isoformat()}",
+                    f"-QuickTime:CreationDate={self.value.isoformat()}",
                 ])
             elif self.date_type == "modified":
                 args.extend([
                     f"-XMP:ModifyDate={self.value.isoformat()}",
                     f"-QuickTime:ModifyDate={utc_time_str}",
+                    f"-EXIF:OffsetTime={offset_str_formatted}",
                 ])
 
         return args

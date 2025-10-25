@@ -375,6 +375,7 @@ class PhotoProcessor:
             raw_exif,
             keys=[
                 "XMP:DateTimeOriginal",
+                "XMP-exif:DateTimeOriginal",
                 "EXIF:DateTimeOriginal",
                 "QuickTime:CreationDate",
                 "QuickTime:CreateDate",
@@ -382,6 +383,7 @@ class PhotoProcessor:
                 "Keys:CreationDate",
                 "UserData:DateTimeOriginal",
                 "XMP:CreateDate",
+                "XMP-xmp:CreateDate",
                 "EXIF:CreateDate",
             ],
             type_name="dt",
@@ -390,7 +392,7 @@ class PhotoProcessor:
 
         date_offset_entries = self._get_metadata_entries_from_dict(
             raw_exif,
-            keys=["EXIF:OffsetTimeOriginal"],
+            keys=["EXIF:OffsetTimeOriginal", "XMP:OffsetTime"],
             type_name="str"
         )
         entries.extend(date_offset_entries)
