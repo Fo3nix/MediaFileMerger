@@ -20,7 +20,7 @@ from tqdm import tqdm
 from sqlalchemy.orm import Session, selectinload
 from photoprocessor.database import engine, SessionLocal
 from photoprocessor import models
-from photoprocessor.export_arguments import ExportArgument, DateTimeArgument
+from photoprocessor.export_arguments import ExportArgument, DateTimeArgument, SimpleArgument
 from photoprocessor.merger import MergeStep, GPSMergeStep, MergeContext, BasicFieldMergeStep, MergePipeline, \
     DateTimeAndZoneMergeStep
 
@@ -317,7 +317,7 @@ def generate_relative_export_path(media_file: models.MediaFile, export_arguments
 
     # --- Priority 3: General Rules (Non-WhatsApp) using ALL locations ---
     general_rules = [
-        ('dcim/camera', "Camera"),
+        # ('dcim/camera', "Camera"),
         ('screenshots', "Screenshots"),
     ]
     all_paths = [loc.path.lower().replace('\\', '/') for loc in media_file.locations]
@@ -407,6 +407,9 @@ def _prepare_export_jobs(
             # Run the merge pipeline only if metadata sources exist
             result_context = pipeline.run(all_sources_for_file)
             final_arguments = result_context.get_all_arguments()
+
+        if final_arguments:
+            final_arguments.append(SimpleArgument("XMP:MetadataDate", datetime.now(timezone.utc).isoformat()))
 
         relative_path, source_loc_to_copy = generate_relative_export_path(loc.media_file, final_arguments, owner)
 
@@ -550,6 +553,11 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
     try:
         with SessionLocal() as db, open(conflict_paths_file, 'w', encoding='utf-8') as conflict_fp:
 
+            owner = db.query(models.Owner).filter(models.Owner.name == owner_name).first()
+            if not owner:
+                print(f"❌ ERROR: Owner '{owner_name}' not found in the database.")
+                return
+
             locations_to_export = []
             if filelist_path:
                 print(f"Reading file list from: {filelist_path}")
@@ -558,9 +566,6 @@ def export_main(owner_name: str, export_dir: str, filelist_path: str = None):
                     print(paths)
                 locations_to_export = get_locations_by_paths(db, paths)
             elif owner_name:
-                owner = db.query(models.Owner).filter(models.Owner.name == owner_name).first()
-                if not owner:
-                    raise ValueError(f"Owner '{owner_name}' not found.")
                 locations_to_export = get_locations_for_owner(db, owner)
 
             if not locations_to_export:
