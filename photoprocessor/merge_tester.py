@@ -21,13 +21,14 @@ def process_test_batch(
         batch_locations: List[models.Location],
         logger: logging.Logger,
         conflict_fp,
+        merged_fp,
         pipeline: MergePipeline
 ) -> Dict[str, int]:
     """
-    Runs only the merge logic for a batch of files and records conflicts.
-    This is a lightweight version of process_export_batch from export_pipe.py.
+    Runs only the merge logic for a batch of files and records conflicts and successful merges.
+    Logs details about which original files were merged into which resulting files.
     """
-    stats = {"scanned": 0, "conflicts": 0}
+    stats = {"scanned": 0, "conflicts": 0, "merged": 0}
     for loc in batch_locations:
         stats["scanned"] += 1
         metadata_sources = loc.media_file.all_metadata_sources
@@ -42,6 +43,15 @@ def process_test_batch(
             log_conflict(logger, loc.path, result_context.conflicts)
             conflict_fp.write(f"{loc.path}\n")
             conflict_fp.flush()
+        else:
+            stats["merged"] += 1
+            if len(loc.media_file.locations) > 1:
+                merged_fp.write(f"Result File: {loc.path}\n")
+                merged_fp.write("Merged From:\n")
+                for location in loc.media_file.locations:
+                    merged_fp.write(f"  - {location.path}\n")
+                merged_fp.write("\n")
+                merged_fp.flush()
 
     return stats
 
@@ -55,6 +65,7 @@ def merge_tester_main(owner_name: str, filelist_path: str = None):
     os.makedirs(output_dir, exist_ok=True)
     conflict_log_path = os.path.join(output_dir, 'merge_conflicts.log')
     conflict_paths_file = os.path.join(output_dir, 'merge_conflicts_paths.txt')
+    merged_paths_file = os.path.join(output_dir, 'merged_files.log')
 
     # Safety check to prevent overwriting an input file
     if filelist_path and os.path.abspath(filelist_path) == os.path.abspath(conflict_paths_file):
@@ -68,13 +79,13 @@ def merge_tester_main(owner_name: str, filelist_path: str = None):
     fh.setFormatter(formatter)
     conflict_logger.addHandler(fh)
 
-    total_stats = {"scanned": 0, "conflicts": 0}
+    total_stats = {"scanned": 0, "conflicts": 0, "merged": 0}
 
     # --- Instantiate the exact same pipeline from the export process ---
     export_merge_pipeline = MergePipeline.get_default_pipeline()
 
     try:
-        with SessionLocal() as db, open(conflict_paths_file, 'w', encoding='utf-8') as conflict_fp:
+        with SessionLocal() as db, open(conflict_paths_file, 'w', encoding='utf-8') as conflict_fp, open(merged_paths_file, 'w', encoding='utf-8') as merged_fp:
             # --- Use the exact same query logic from export_pipe.py ---
             locations_to_test = []
             if filelist_path:
@@ -97,22 +108,25 @@ def merge_tester_main(owner_name: str, filelist_path: str = None):
             with tqdm(total=total_files, desc="Testing Merges", unit="file") as pbar:
                 for i in range(0, total_files, CONFIG["BATCH_SIZE"]):
                     batch = locations_to_test[i:i + CONFIG["BATCH_SIZE"]]
-                    stats = process_test_batch(batch, conflict_logger, conflict_fp, export_merge_pipeline)
+                    stats = process_test_batch(batch, conflict_logger, conflict_fp, merged_fp, export_merge_pipeline)
 
                     total_stats["scanned"] += stats["scanned"]
                     total_stats["conflicts"] += stats["conflicts"]
+                    total_stats["merged"] += stats["merged"]
 
                     pbar.update(len(batch))
-                    pbar.set_postfix(scanned=total_stats['scanned'], conflicts=total_stats['conflicts'])
+                    pbar.set_postfix(scanned=total_stats['scanned'], conflicts=total_stats['conflicts'], merged=total_stats['merged'])
     finally:
         print("\n--- Merge Test Complete ---")
         print(f"✅ Scanned {total_stats['scanned']} files.")
+        print(f"✅ Successfully merged {total_stats['merged']} files.")
         if total_stats['conflicts'] > 0:
             print(f"⚠️ Found {total_stats['conflicts']} files with merge conflicts.")
             print(f"   See conflict details in the log file: {conflict_log_path}")
             print(f"   A list of conflicted file paths has been saved to: {conflict_paths_file}")
         else:
             print("🎉 No merge conflicts found!")
+        print(f"   A list of successfully merged file paths has been saved to: {merged_paths_file}")
         print("---------------------------")
 
 
