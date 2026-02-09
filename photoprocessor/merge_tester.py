@@ -2,13 +2,11 @@ import os
 import argparse
 import logging
 import sys
-from typing import List, Dict, Any
-
+from typing import List, Dict
 from tqdm import tqdm
-from sqlalchemy.orm import Session
 from photoprocessor import models
 from photoprocessor.database import SessionLocal
-from photoprocessor.merger import GPSMergeStep, DateTimeAndZoneMergeStep, MergePipeline, BasicFieldMergeStep
+from photoprocessor.merger import MergePipeline
 from photoprocessor.export_pipe import get_locations_for_owner, get_locations_by_paths, log_conflict
 
 # Configuration (can be smaller as it's not I/O intensive)
@@ -27,9 +25,17 @@ def process_test_batch(
     """
     Runs only the merge logic for a batch of files and records conflicts and successful merges.
     Logs details about which original files were merged into which resulting files.
+    Ensures each media file is processed only once.
     """
     stats = {"scanned": 0, "conflicts": 0, "merged": 0}
+    processed_media_files = set()  # Track processed media files
+
     for loc in batch_locations:
+        media_file_id = loc.media_file.id  # Unique identifier for the media file
+        if media_file_id in processed_media_files:
+            continue  # Skip already processed media files
+
+        processed_media_files.add(media_file_id)
         stats["scanned"] += 1
         metadata_sources = loc.media_file.all_metadata_sources
         if not metadata_sources:
