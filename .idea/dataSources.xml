@@ -47,5 +47,12 @@
         </library>
       </libraries>
     </data-source>
+    <data-source source="LOCAL" name="sqlite" uuid="7364df70-0abc-4738-ba40-9a8467ed2e29">
+      <driver-ref>sqlite.xerial</driver-ref>
+      <synchronize>true</synchronize>
+      <jdbc-driver>org.sqlite.JDBC</jdbc-driver>
+      <jdbc-url>jdbc:sqlite:$PROJECT_DIR$/photos.db</jdbc-url>
+      <working-dir>$ProjectFileDir$</working-dir>
+    </data-source>
   </component>
 </project>
