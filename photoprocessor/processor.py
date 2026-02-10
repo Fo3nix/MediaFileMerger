@@ -215,6 +215,19 @@ def _hash_file_partially(filepath: str, chunk_size=1024 * 1024) -> str:
     except (FileNotFoundError, OSError):
         return ""
 
+def _extract_whatsapp_signature(filename: str) -> str | None:
+    """
+    Extracts the 'IMG-YYYYMMDD-WAxxxx' signature from a filename.
+    Ignores appended copy numbers like '(1)'.
+    """
+    # Regex matches standard WA format: prefix (IMG/VID/PTT) - 8 digits - WA - digits
+    match = re.search(r'((?:IMG|VID|AUD|PTT)-\d{8}-WA\d+)', filename, re.IGNORECASE)
+    if match:
+        # return "YYYYMMDD-WAxxxx"
+        return match.group(1).split('-', 1)[1]  # Split off the prefix (IMG/VID/AUD/PTT)
+
+    return None
+
 class PhotoProcessor:
     """Processes a single photo file to extract and structure data for the database."""
 
@@ -530,6 +543,13 @@ class PhotoProcessor:
 
                     if not file_hash:
                         raise ValueError("Hashing failed")
+
+                    # This splits identical files into separate MediaFiles
+                    # IF AND ONLY IF their WhatsApp ID (date+number) is different.
+                    filename = os.path.basename(path)
+                    wa_sig = _extract_whatsapp_signature(filename)
+                    if wa_sig:
+                        file_hash = f"{file_hash}-{wa_sig}"
 
                     raw_exif_dict = data["raw_exif_dict"]
                     google_json_list = data["google_json_list"]

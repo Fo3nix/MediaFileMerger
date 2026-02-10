@@ -1019,6 +1019,71 @@ class FallbackRoughDateFromFilename(MergeStep):
                     # such as February 30th. Continue to the next filename.
                     continue
 
+
+class WhatsappDateCorrectionStep(MergeStep):
+    """
+    Sanity check: If the final resolved 'taken' date differs significantly
+    (> 4 days) from the date found in the WhatsApp filename, force the
+    WhatsApp date (at 12:00 PM).
+    """
+
+    def process(self, context: MergeContext):
+        # 1. Get the current resolved 'taken' date
+        current_date = context.get_value("taken")
+
+        # 2. Extract date from filename(s)
+        # We check all filenames associated with this file (source file + google title)
+        filename_entries = context.get_entries_by_keys(["google:title", "exiftool:SourceFile"])
+
+        wa_date = None
+        for entry in filename_entries:
+            val = entry.value_str
+            if not val: continue
+
+            # Match YYYYMMDD inside a WhatsApp signature
+            match = re.search(r'(?:IMG|VID|AUD|PTT)-(\d{8})-WA\d+', val, re.IGNORECASE)
+            if match:
+                try:
+                    d_str = match.group(1)
+                    # Create a naive datetime for noon
+                    wa_date = datetime.strptime(d_str, "%Y%m%d").replace(hour=12, minute=0, second=0)
+                    break
+                except ValueError:
+                    print('Invalid date found in WhatsApp filename pattern:', match.group(0))
+                    continue
+            else:
+                print('No WhatsApp date pattern found in filename:', val)
+
+        if not wa_date:
+            return
+
+        # 3. Compare and Override
+        # If we have no date yet, OR if the dates disagree by > 4 days
+        should_override = False
+        if not current_date:
+            should_override = True
+        else:
+            # Make naive for comparison
+            c_naive = current_date.replace(tzinfo=None)
+            diff = abs(c_naive - wa_date)
+            if diff.days > 4:
+                should_override = True
+                # if not (wa_date.month == 6 and wa_date.day == 18):
+                #     print(f"WhatsApp date {wa_date.date()} differs from resolved 'taken' date {c_naive.date()} by {diff.days} days. Overriding with WhatsApp date for a non-june 18th date.")
+
+        if should_override:
+            # Force 'taken' and 'modified' to the WhatsApp date
+            taken_arg = DateTimeArgument(wa_date, "taken")
+            context.set_value("taken", taken_arg)
+
+            # Also fix modified if it's missing or also wrong
+            mod_arg = context.get_value("modified")
+            mod_date = mod_arg.value if isinstance(mod_arg, DateTimeArgument) else None
+
+            if not mod_date or abs(mod_date.replace(tzinfo=None) - wa_date).days > 4:
+                modified_arg = DateTimeArgument(wa_date, "modified")
+                context.set_value("modified", modified_arg)
+
 # --- The Pipeline Orchestrator ---
 
 class MergePipeline:
@@ -1036,6 +1101,7 @@ class MergePipeline:
             FallbackDateTimeStep("modified", "taken"),
             FallbackDateTimeStep("taken", "modified"),
             FallbackRoughDateFromFilename(),
+            WhatsappDateCorrectionStep()
         ]
         return cls(steps)
 

@@ -20,7 +20,8 @@ def process_test_batch(
         logger: logging.Logger,
         conflict_fp,
         merged_fp,
-        pipeline: MergePipeline
+        pipeline: MergePipeline,
+        processed_media_files: set
 ) -> Dict[str, int]:
     """
     Runs only the merge logic for a batch of files and records conflicts and successful merges.
@@ -28,7 +29,6 @@ def process_test_batch(
     Ensures each media file is processed only once.
     """
     stats = {"scanned": 0, "conflicts": 0, "merged": 0}
-    processed_media_files = set()  # Track processed media files
 
     for loc in batch_locations:
         media_file_id = loc.media_file.id  # Unique identifier for the media file
@@ -111,10 +111,12 @@ def merge_tester_main(owner_name: str, filelist_path: str = None):
             total_files = len(locations_to_test)
             print(f"Found {total_files} files to test for merge conflicts.")
 
+            global_processed_ids = set()
+
             with tqdm(total=total_files, desc="Testing Merges", unit="file") as pbar:
                 for i in range(0, total_files, CONFIG["BATCH_SIZE"]):
                     batch = locations_to_test[i:i + CONFIG["BATCH_SIZE"]]
-                    stats = process_test_batch(batch, conflict_logger, conflict_fp, merged_fp, export_merge_pipeline)
+                    stats = process_test_batch(batch, conflict_logger, conflict_fp, merged_fp, export_merge_pipeline, global_processed_ids)
 
                     total_stats["scanned"] += stats["scanned"]
                     total_stats["conflicts"] += stats["conflicts"]

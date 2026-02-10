@@ -219,7 +219,7 @@ def copy_file_task(src_dst_tuple: Tuple[str, str]):
 
     for attempt in range(retries):
         try:
-            shutil.copyfile(src, dst)
+            shutil.copy2(src, dst)
             return src, None  # Success!
         except OSError as e:
             # On Windows, error 32 is "The process cannot access the file..."
@@ -250,11 +250,36 @@ def log_conflict(logger: logging.Logger, file_path: str, conflicts: Dict[str, Li
     details_str = "\n    ".join(conflict_lines)
     logger.warning(f"{file_path}\n    {details_str}")
 
+
 def _get_best_location(locations: List[models.Location]) -> models.Location:
-    """Selects the best location from a list based on largest file size, with ID as a tie-breaker."""
+    """
+    Selects the best location from a list.
+    Prioritizes 'pure' WhatsApp filenames (no copy counters like '(1)') first,
+    then largest file size, then ID.
+    """
     if not locations:
         raise ValueError("Cannot select best location from an empty list.")
-    return sorted(locations, key=lambda l: (-l.file_size, l.id))[0]
+
+    # Regex for a "pure" WhatsApp filename (e.g., IMG-20180106-WA0001.jpg).
+    # It ensures the string ends immediately after the WA number and extension,
+    # thereby excluding files with ' (1)', '-1', etc.
+    pure_wa_regex = re.compile(r'^(?:IMG|VID|AUD|PTT)-\d{8}-WA\d+\.[a-z0-9]+$', re.IGNORECASE)
+
+    def sort_key(loc: models.Location):
+        # We sort descending, so the criteria should be (Higher Priority, Larger Size, Higher ID)
+
+        # Criterion 1: Is it a pure WhatsApp file? (True=1, False=0)
+        # This forces the "pure" signature to win over a larger but "messy" file.
+        is_pure_wa = bool(pure_wa_regex.match(loc.filename))
+
+        # Criterion 2: File size (larger is better)
+        size = loc.file_size
+
+        # Criterion 3: ID (arbitrary tie-breaker)
+        return (is_pure_wa, size, loc.id)
+
+    # Sort descending: True comes before False, Larger size comes before smaller
+    return sorted(locations, key=sort_key, reverse=True)[0]
 
 def generate_relative_export_path(media_file: models.MediaFile, export_arguments: List[ExportArgument], owner: models.Owner) -> Tuple[str, models.Location]:
     """
@@ -431,7 +456,7 @@ def _handle_failed_job(job: FileExportJob, failed_dir: str):
         failure_path = os.path.join(failed_dir, job.relative_path)
         unique_failure_path = find_unique_filepath(failure_path)
         os.makedirs(os.path.dirname(unique_failure_path), exist_ok=True)
-        shutil.copyfile(job.source_location_to_copy.path, unique_failure_path)
+        shutil.copy2(job.source_location_to_copy.path, unique_failure_path)
 
         # Create the arguments log file
         args_log_path = os.path.splitext(unique_failure_path)[0] + ".txt"
