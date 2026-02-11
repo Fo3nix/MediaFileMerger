@@ -415,7 +415,8 @@ class PhotoProcessor:
             keys=[
                 "XMP:ModifyDate",
                 "QuickTime:ModifyDate",
-                "EXIF:ModifyDate"
+                "EXIF:ModifyDate",
+                "File:FileModifyDate"
             ],
             type_name="dt",
         )

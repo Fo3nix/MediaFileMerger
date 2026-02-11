@@ -1020,6 +1020,41 @@ class FallbackRoughDateFromFilename(MergeStep):
                     continue
 
 
+class FallbackFileModifyDateStep(MergeStep):
+    """
+    Fallback: If no 'taken' or 'modified' date is found yet, use the filesystem's
+    File Modify Date as a last resort.
+    """
+
+    def process(self, context: MergeContext):
+        # 1. Check if dates are already resolved or conflicted.
+        #    If either is set, we assume the file has been handled by a better method.
+        if "taken" in context.finalized_fields or "taken" in context.conflicts:
+            return
+        if "modified" in context.finalized_fields or "modified" in context.conflicts:
+            return
+
+        # 2. Look for File:FileModifyDate
+        entries = context.get_entries_by_keys(["File:FileModifyDate"])
+        if not entries:
+            return
+
+        # There should technically only be one File:FileModifyDate from the main file
+        # taking the first one found is safe enough.
+        entry = entries[0]
+        file_date = entry.value_dt
+
+        if not file_date:
+            return
+
+        # 3. Apply to both fields
+        # Note: FileModifyDate is usually naive (local time). DateTimeArgument handles it.
+        taken_arg = DateTimeArgument(file_date, "taken")
+        context.set_value("taken", taken_arg)
+
+        modified_arg = DateTimeArgument(file_date, "modified")
+        context.set_value("modified", modified_arg)
+
 class WhatsappDateCorrectionStep(MergeStep):
     """
     Sanity check: If the final resolved 'taken' date differs significantly
@@ -1100,6 +1135,7 @@ class MergePipeline:
             FallbackDateToGpsDateTimeStep(),
             FallbackDateTimeStep("modified", "taken"),
             FallbackDateTimeStep("taken", "modified"),
+            FallbackFileModifyDateStep(),
             FallbackRoughDateFromFilename(),
             WhatsappDateCorrectionStep()
         ]

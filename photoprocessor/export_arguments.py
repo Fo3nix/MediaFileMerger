@@ -137,5 +137,23 @@ class DateTimeArgument(ExportArgument):
                     f"-QuickTime:ModifyDate={utc_time_str}",
                     f"-EXIF:OffsetTime={offset_str_formatted}",
                 ])
+        else:
+            # For naive datetimes, we can still write XMP tags without timezone, and any other tags that don't require timezone info
+            # For tags that require timezone info, we make them empty
+            if self.date_type == "taken":
+                args.extend([
+                    f"-XMP:DateTimeOriginal={local_time_str}",
+                    f"-EXIF:OffsetTimeOriginal=",
+                    f"-XMP:CreateDate=",
+                    f"-QuickTime:CreateDate=",
+                    f"-Keys:CreationDate=",
+                    f"-QuickTime:CreationDate=",
+                ])
+            elif self.date_type == "modified":
+                args.extend([
+                    f"-XMP:ModifyDate={local_time_str}",
+                    f"-QuickTime:ModifyDate=",
+                    f"-EXIF:OffsetTime=",
+                ])
 
         return args
